@@ -164,6 +164,15 @@ static ssize_t mtd_erasesize_show(struct device *dev,
 }
 static DEVICE_ATTR(erasesize, S_IRUGO, mtd_erasesize_show, NULL);
 
+static ssize_t mtd_erasesize_minor_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct mtd_info *mtd = dev_get_drvdata(dev);
+
+	return snprintf(buf, PAGE_SIZE, "%lu\n", (unsigned long)mtd->erasesize_minor);
+}
+static DEVICE_ATTR(erasesize_minor, S_IRUGO, mtd_erasesize_minor_show, NULL);
+
 static ssize_t mtd_writesize_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -313,6 +322,7 @@ static struct attribute *mtd_attrs[] = {
 	&dev_attr_flags.attr,
 	&dev_attr_size.attr,
 	&dev_attr_erasesize.attr,
+	&dev_attr_erasesize_minor.attr,
 	&dev_attr_writesize.attr,
 	&dev_attr_subpagesize.attr,
 	&dev_attr_oobsize.attr,
