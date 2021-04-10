@@ -758,12 +758,18 @@ int add_mtd_device(struct mtd_info *mtd)
 
 	if (of_find_property(mtd_get_of_node(mtd), "linux,rootfs", NULL) ||
 	    (IS_ENABLED(CONFIG_MTD_ROOTFS_ROOT_DEV) && !strcmp(mtd->name, "rootfs") && ROOT_DEV == 0)) {
+		unsigned int index = mtd->index;
+
+#ifdef CONFIG_FIT_PARTITION
+		index <<= 2;
+#endif
+
 		if (IS_BUILTIN(CONFIG_MTD)) {
-			pr_info("mtd: setting mtd%d (%s) as root device\n", mtd->index, mtd->name);
-			ROOT_DEV = MKDEV(MTD_BLOCK_MAJOR, mtd->index);
+			pr_info("mtd: setting mtd%d (%s) as root device\n", index, mtd->name);
+			ROOT_DEV = MKDEV(MTD_BLOCK_MAJOR, index);
 		} else {
 			pr_warn("mtd: can't set mtd%d (%s) as root device - mtd must be builtin\n",
-				mtd->index, mtd->name);
+				index, mtd->name);
 		}
 	}
 
