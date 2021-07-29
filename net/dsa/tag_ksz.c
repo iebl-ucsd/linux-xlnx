@@ -25,7 +25,7 @@ static struct sk_buff *ksz_common_rcv(struct sk_buff *skb,
 	if (pskb_trim_rcsum(skb, skb->len - len))
 		return NULL;
 
-	skb->offload_fwd_mark = true;
+	dsa_default_offload_fwd_mark(skb);
 
 	return skb;
 }
