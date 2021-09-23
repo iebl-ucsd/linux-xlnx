@@ -1634,9 +1634,7 @@ static int advk_pcie_enable_phy(struct advk_pcie *pcie)
 	}
 
 	ret = phy_power_on(pcie->phy);
-	if (ret == -EOPNOTSUPP) {
-		dev_warn(&pcie->pdev->dev, "PHY unsupported by firmware\n");
-	} else if (ret) {
+	if (ret) {
 		phy_exit(pcie->phy);
 		return ret;
 	}
