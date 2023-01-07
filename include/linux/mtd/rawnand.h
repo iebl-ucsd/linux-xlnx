@@ -475,15 +475,6 @@ struct nand_sdr_timings {
 };
 
 /**
- * nand_interface_is_sdr - get the interface type
- * @conf:	The data interface
- */
-static bool nand_interface_is_sdr(const struct nand_interface_config *conf)
-{
-	return conf->type == NAND_SDR_IFACE;
-}
-
-/**
  * struct nand_nvddr_timings - NV-DDR NAND chip timings
  *
  * This struct defines the timing requirements of a NV-DDR NAND data interface.
@@ -645,15 +636,6 @@ static bool nand_interface_is_nvddr(const struct nand_interface_config *conf)
 }
 
 /**
- * nand_interface_is_nvddr - get the interface type
- * @conf:	The data interface
- */
-static bool nand_interface_is_nvddr(const struct nand_interface_config *conf)
-{
-	return conf->type == NAND_NVDDR_IFACE;
-}
-
-/**
  * nand_get_sdr_timings - get SDR timing from data interface
  * @conf:	The data interface
  */
@@ -664,19 +646,6 @@ nand_get_sdr_timings(const struct nand_interface_config *conf)
 		return ERR_PTR(-EINVAL);
 
 	return &conf->timings.sdr;
-}
-
-/**
- * nand_get_nvddr_timings - get NV-DDR timing from data interface
- * @conf:	The data interface
- */
-static inline const struct nand_nvddr_timings *
-nand_get_nvddr_timings(const struct nand_interface_config *conf)
-{
-	if (!nand_interface_is_nvddr(conf))
-		return ERR_PTR(-EINVAL);
-
-	return &conf->timings.nvddr;
 }
 
 /**
