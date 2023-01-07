@@ -53,6 +53,7 @@
 #define   PROG_RST			BIT(8)
 #define   PROG_GET_FEATURE		BIT(9)
 #define   PROG_SET_FEATURE		BIT(10)
+#define   PROG_CHG_RD_COL_ENH		BIT(14)
 
 #define INTR_STS_EN_REG			0x14
 #define INTR_SIG_EN_REG			0x18
@@ -676,7 +677,23 @@ static int anfc_param_read_type_exec(struct nand_chip *chip,
 static int anfc_data_read_type_exec(struct nand_chip *chip,
 				    const struct nand_subop *subop)
 {
-	return anfc_misc_data_type_exec(chip, subop, PROG_PGRD);
+	u32 prog_reg = PROG_PGRD;
+
+	/*
+	 * Experience shows that while in SDR mode sending a CHANGE READ COLUMN
+	 * command through the READ PAGE "type" always works fine, when in
+	 * NV-DDR mode the same command simply fails. However, it was also
+	 * spotted that any CHANGE READ COLUMN command sent through the CHANGE
+	 * READ COLUMN ENHANCED "type" would correctly work in both cases (SDR
+	 * and NV-DDR). So, for simplicity, let's program the controller with
+	 * the CHANGE READ COLUMN ENHANCED "type" whenever we are requested to
+	 * perform a CHANGE READ COLUMN operation.
+	 */
+	if (subop->instrs[0].ctx.cmd.opcode == NAND_CMD_RNDOUT &&
+	    subop->instrs[2].ctx.cmd.opcode == NAND_CMD_RNDOUTSTART)
+		prog_reg = PROG_CHG_RD_COL_ENH;
+
+	return anfc_misc_data_type_exec(chip, subop, prog_reg);
 }
 
 static int anfc_param_write_type_exec(struct nand_chip *chip,
@@ -810,6 +827,7 @@ static const struct nand_op_parser anfc_op_parser = NAND_OP_PARSER(
 static int anfc_check_op(struct nand_chip *chip,
 			 const struct nand_operation *op)
 {
+	struct mtd_info *mtd = nand_to_mtd(chip);
 	const struct nand_op_instr *instr;
 	int op_id;
 
@@ -858,6 +876,35 @@ static int anfc_check_op(struct nand_chip *chip,
 	    op->instrs[0].ctx.cmd.opcode != NAND_CMD_STATUS &&
 	    op->instrs[1].type == NAND_OP_DATA_IN_INSTR)
 		return -ENOTSUPP;
+
+	/*
+	 * The controller only supports data payload requests which are a
+	 * multiple of 4. This may confuse the core as the core could request a
+	 * given number of bytes and then another number of bytes without
+	 * re-synchronizing the pointer. In practice, most data accesses are
+	 * 4-byte aligned and thus this is not an issue in practice. However,
+	 * rounding up will not work if we reached the end of the device. Any
+	 * unaligned data request that ends at the device boundary would confuse
+	 * the controller and cannot be performed.
+	 *
+	 * TODO: The nand_op_parser framework should be extended to
+	 * support custom checks on DATA instructions.
+	 */
+	if (op->ninstrs == 4 &&
+	    op->instrs[0].type == NAND_OP_CMD_INSTR &&
+	    op->instrs[1].type == NAND_OP_ADDR_INSTR &&
+	    op->instrs[1].ctx.addr.naddrs == 2 &&
+	    op->instrs[2].type == NAND_OP_CMD_INSTR &&
+	    op->instrs[3].type == NAND_OP_DATA_IN_INSTR) {
+		unsigned int start_off, end_off;
+
+		start_off = (op->instrs[1].ctx.addr.addrs[1] << 8) +
+			    op->instrs[1].ctx.addr.addrs[0];
+		end_off = start_off + round_up(op->instrs[3].ctx.data.len, 4);
+
+		if (end_off >= mtd->writesize + mtd->oobsize)
+			return -ENOTSUPP;
+	}
 
 	return nand_op_parser_exec_op(chip, &anfc_op_parser, op, true);
 }

@@ -1,0 +1,253 @@
+--- drivers/spi/spi-zynqmp-gqspi.c
++++ drivers/spi/spi-zynqmp-gqspi.c
+@@ -211,9 +252,15 @@ struct zynqmp_qspi {
+ 	u32 genfifobus;
+ 	u32 dma_rx_bytes;
+ 	dma_addr_t dma_addr;
++	u32 rx_bus_width;
++	u32 tx_bus_width;
+ 	u32 genfifoentry;
+ 	enum mode_type mode;
++	u32 speed_hz;
++	bool io_mode;
++	bool has_tapdelay;
+ 	struct completion data_completion;
++	struct mutex op_lock;
+ };
+ 
+ /**
+@@ -646,18 +778,21 @@ static void zynqmp_qspi_filltxfifo(struct zynqmp_qspi *xqspi, int size)
+ {
+ 	u32 count = 0, intermediate;
+ 
+-	while ((xqspi->bytes_to_transfer > 0) && (count < size)) {
+-		memcpy(&intermediate, xqspi->txbuf, 4);
+-		zynqmp_gqspi_write(xqspi, GQSPI_TXD_OFST, intermediate);
+-
+-		if (xqspi->bytes_to_transfer >= 4) {
+-			xqspi->txbuf += 4;
+-			xqspi->bytes_to_transfer -= 4;
+-		} else {
+-			xqspi->txbuf += xqspi->bytes_to_transfer;
+-			xqspi->bytes_to_transfer = 0;
+-		}
+-		count++;
++	while ((xqspi->bytes_to_transfer > 0) && (count < size) &&
++	       (xqspi->txbuf)) {
++                if (xqspi->bytes_to_transfer >= 4) {
++                        memcpy(&intermediate, xqspi->txbuf, 4);
++                        xqspi->txbuf += 4;
++                        xqspi->bytes_to_transfer -= 4;
++                        count += 4;
++                } else {
++                        memcpy(&intermediate, xqspi->txbuf,
++                               xqspi->bytes_to_transfer);
++                        xqspi->txbuf += xqspi->bytes_to_transfer;
++                        xqspi->bytes_to_transfer = 0;
++                        count += xqspi->bytes_to_transfer;
++                }
++                zynqmp_gqspi_write(xqspi, GQSPI_TXD_OFST, intermediate);
+ 	}
+ }
+ 
+@@ -705,7 +840,7 @@ static void zynqmp_qspi_fillgenfifo(struct zynqmp_qspi *xqspi, u8 nbits,
+ 		genfifoentry |= GQSPI_GENFIFO_DATA_XFER;
+ 		genfifoentry |= GQSPI_GENFIFO_TX;
+ 		transfer_len = xqspi->bytes_to_transfer;
+-	} else {
++	} else if (xqspi->rxbuf) {
+ 		genfifoentry &= ~GQSPI_GENFIFO_TX;
+ 		genfifoentry |= GQSPI_GENFIFO_DATA_XFER;
+ 		genfifoentry |= GQSPI_GENFIFO_RX;
+@@ -713,6 +848,10 @@ static void zynqmp_qspi_fillgenfifo(struct zynqmp_qspi *xqspi, u8 nbits,
+ 			transfer_len = xqspi->dma_rx_bytes;
+ 		else
+ 			transfer_len = xqspi->bytes_to_receive;
++	} else {
++		genfifoentry &= ~(GQSPI_GENFIFO_TX | GQSPI_GENFIFO_RX);
++		genfifoentry |= GQSPI_GENFIFO_DATA_XFER;
++		transfer_len = xqspi->bytes_to_transfer;
+ 	}
+ 	genfifoentry |= zynqmp_qspi_selectspimode(xqspi, nbits);
+ 	xqspi->genfifoentry = genfifoentry;
+@@ -954,8 +1100,8 @@ static void zynqmp_qspi_write_op(struct zynqmp_qspi *xqspi, u8 tx_nbits,
+ static void zynqmp_qspi_read_op(struct zynqmp_qspi *xqspi, u8 rx_nbits,
+ 				u32 genfifoentry)
+ {
+-	zynqmp_qspi_fillgenfifo(xqspi, rx_nbits, genfifoentry);
+ 	zynqmp_qspi_setuprxdma(xqspi);
++	zynqmp_qspi_fillgenfifo(xqspi, rx_nbits, genfifoentry);
+ }
+ 
+ /**
+@@ -1024,7 +1171,8 @@ static int __maybe_unused zynqmp_qspi_resume(struct device *dev)
+  */
+ static int __maybe_unused zynqmp_runtime_suspend(struct device *dev)
+ {
+-	struct zynqmp_qspi *xqspi = (struct zynqmp_qspi *)dev_get_drvdata(dev);
++	struct spi_controller *ctlr = dev_get_drvdata(dev);
++	struct zynqmp_qspi *xqspi = spi_controller_get_devdata(ctlr);
+ 
+ 	clk_disable(xqspi->refclk);
+ 	clk_disable(xqspi->pclk);
+@@ -1042,7 +1190,8 @@ static int __maybe_unused zynqmp_runtime_suspend(struct device *dev)
+  */
+ static int __maybe_unused zynqmp_runtime_resume(struct device *dev)
+ {
+-	struct zynqmp_qspi *xqspi = (struct zynqmp_qspi *)dev_get_drvdata(dev);
++	struct spi_controller *ctlr = dev_get_drvdata(dev);
++	struct zynqmp_qspi *xqspi = spi_controller_get_devdata(ctlr);
+ 	int ret;
+ 
+ 	ret = clk_enable(xqspi->pclk);
+@@ -1085,6 +1234,7 @@ static int zynqmp_qspi_exec_op(struct spi_mem *mem,
+ 		op->cmd.opcode, op->cmd.buswidth, op->addr.buswidth,
+ 		op->dummy.buswidth, op->data.buswidth);
+ 
++	mutex_lock(&xqspi->op_lock);
+ 	zynqmp_qspi_config_op(xqspi, mem->spi);
+ 	zynqmp_qspi_chipselect(mem->spi, false);
+ 	genfifoentry |= xqspi->genfifocs;
+@@ -1105,9 +1255,10 @@ static int zynqmp_qspi_exec_op(struct spi_mem *mem,
+ 				   zynqmp_gqspi_read(xqspi, GQSPI_CONFIG_OFST) |
+ 				   GQSPI_CFG_START_GEN_FIFO_MASK);
+ 		zynqmp_gqspi_write(xqspi, GQSPI_IER_OFST,
++				   GQSPI_IER_TXEMPTY_MASK |
+ 				   GQSPI_IER_GENFIFOEMPTY_MASK |
+ 				   GQSPI_IER_TXNOT_FULL_MASK);
+-		if (!wait_for_completion_interruptible_timeout
++		if (!wait_for_completion_timeout
+ 		    (&xqspi->data_completion, msecs_to_jiffies(1000))) {
+ 			err = -ETIMEDOUT;
+ 			kfree(tmpbuf);
+@@ -1135,7 +1286,7 @@ static int zynqmp_qspi_exec_op(struct spi_mem *mem,
+ 				   GQSPI_IER_TXEMPTY_MASK |
+ 				   GQSPI_IER_GENFIFOEMPTY_MASK |
+ 				   GQSPI_IER_TXNOT_FULL_MASK);
+-		if (!wait_for_completion_interruptible_timeout
++		if (!wait_for_completion_timeout
+ 		    (&xqspi->data_completion, msecs_to_jiffies(1000))) {
+ 			err = -ETIMEDOUT;
+ 			goto return_err;
+@@ -1143,35 +1294,32 @@ static int zynqmp_qspi_exec_op(struct spi_mem *mem,
+ 	}
+ 
+ 	if (op->dummy.nbytes) {
+-		tmpbuf = kzalloc(op->dummy.nbytes, GFP_KERNEL | GFP_DMA);
+-		if (!tmpbuf)
+-			return -ENOMEM;
+-		memset(tmpbuf, 0xff, op->dummy.nbytes);
+-		reinit_completion(&xqspi->data_completion);
+-		xqspi->txbuf = tmpbuf;
++		xqspi->txbuf = NULL;
+ 		xqspi->rxbuf = NULL;
+-		xqspi->bytes_to_transfer = op->dummy.nbytes;
++		/*
++		 * xqspi->bytes_to_transfer here represents the dummy circles
++		 * per data line.
++		 */
++		xqspi->bytes_to_transfer = op->dummy.nbytes * 8 / op->dummy.buswidth;
+ 		xqspi->bytes_to_receive = 0;
+-		zynqmp_qspi_write_op(xqspi, op->dummy.buswidth,
++		/*
++		 * Using op->data.buswidth instead of op->dummy.buswidth since
++		 * the specification requires that the dummy.buswidth should
++		 * be the same as data.buswidth.
++		 */
++		zynqmp_qspi_write_op(xqspi, op->data.buswidth,
+ 				     genfifoentry);
+ 		zynqmp_gqspi_write(xqspi, GQSPI_CONFIG_OFST,
+ 				   zynqmp_gqspi_read(xqspi, GQSPI_CONFIG_OFST) |
+ 				   GQSPI_CFG_START_GEN_FIFO_MASK);
+-		zynqmp_gqspi_write(xqspi, GQSPI_IER_OFST,
+-				   GQSPI_IER_TXEMPTY_MASK |
+-				   GQSPI_IER_GENFIFOEMPTY_MASK |
+-				   GQSPI_IER_TXNOT_FULL_MASK);
+-		if (!wait_for_completion_interruptible_timeout
+-		    (&xqspi->data_completion, msecs_to_jiffies(1000))) {
+-			err = -ETIMEDOUT;
+-			kfree(tmpbuf);
+-			goto return_err;
+-		}
+-
+-		kfree(tmpbuf);
+ 	}
+ 
+ 	if (op->data.nbytes) {
++		if (mem->spi->master->flags & SPI_MASTER_DATA_STRIPE) {
++			if (update_stripe(op)) {
++				genfifoentry |= GQSPI_GENFIFO_STRIPE;
++			}
++		}
+ 		reinit_completion(&xqspi->data_completion);
+ 		if (op->data.dir == SPI_MEM_DATA_OUT) {
+ 			xqspi->txbuf = (u8 *)op->data.buf.out;
+@@ -1210,24 +1358,48 @@ static int zynqmp_qspi_exec_op(struct spi_mem *mem,
+ 						   GQSPI_IER_RXEMPTY_MASK);
+ 			}
+ 		}
+-		if (!wait_for_completion_interruptible_timeout
+-		    (&xqspi->data_completion, msecs_to_jiffies(1000)))
++		if (!wait_for_completion_timeout
++		    (&xqspi->data_completion, msecs_to_jiffies(1000000)))
+ 			err = -ETIMEDOUT;
+ 	}
+ 
+ return_err:
+ 
+ 	zynqmp_qspi_chipselect(mem->spi, true);
++	mutex_unlock(&xqspi->op_lock);
+ 
+ 	return err;
+ }
+ 
++static int __maybe_unused zynqmp_runtime_idle(struct device *dev)
++{
++	struct spi_controller *ctlr = dev_get_drvdata(dev);
++	struct zynqmp_qspi *xqspi = spi_controller_get_devdata(ctlr);
++	u32 value;
++
++	value = zynqmp_gqspi_read(xqspi, GQSPI_EN_OFST);
++	if (value)
++		return -EBUSY;
++
++	return 0;
++}
++
+ static const struct dev_pm_ops zynqmp_qspi_dev_pm_ops = {
+ 	SET_RUNTIME_PM_OPS(zynqmp_runtime_suspend,
+-			   zynqmp_runtime_resume, NULL)
++			   zynqmp_runtime_resume, zynqmp_runtime_idle)
+ 	SET_SYSTEM_SLEEP_PM_OPS(zynqmp_qspi_suspend, zynqmp_qspi_resume)
+ };
+ 
++static const struct qspi_platform_data versal_qspi_def = {
++	.quirks = QSPI_QUIRK_HAS_TAPDELAY,
++};
++
++static const struct of_device_id zynqmp_qspi_of_match[] = {
++	{ .compatible = "xlnx,zynqmp-qspi-1.0"},
++	{ .compatible = "xlnx,versal-qspi-1.0", .data = &versal_qspi_def },
++	{ /* End of table */ }
++};
++
+ static const struct spi_controller_mem_ops zynqmp_qspi_mem_ops = {
+ 	.exec_op = zynqmp_qspi_exec_op,
+ };
+@@ -1259,8 +1436,15 @@ static int zynqmp_qspi_probe(struct platform_device *pdev)
+ 
+ 	xqspi = spi_controller_get_devdata(ctlr);
+ 	xqspi->dev = dev;
+-	platform_set_drvdata(pdev, xqspi);
++	platform_set_drvdata(pdev, ctlr);
++
++	match = of_match_node(zynqmp_qspi_of_match, pdev->dev.of_node);
++	if (match) {
++		const struct qspi_platform_data *p_data = match->data;
+ 
++		if (p_data && (p_data->quirks & QSPI_QUIRK_HAS_TAPDELAY))
++			xqspi->has_tapdelay = true;
++	}
+ 	xqspi->regs = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(xqspi->regs)) {
+ 		ret = PTR_ERR(xqspi->regs);

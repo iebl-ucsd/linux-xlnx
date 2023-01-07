@@ -1,0 +1,23 @@
+--- drivers/mtd/spi-nor/core.c
++++ drivers/mtd/spi-nor/core.c
+@@ -3528,9 +4131,18 @@ static int spi_nor_quad_enable(struct spi_nor *nor)
+  */
+ static int spi_nor_unlock_all(struct spi_nor *nor)
+ {
+-	if (nor->flags & SNOR_F_HAS_LOCK)
+-		return spi_nor_unlock(&nor->mtd, 0, nor->params->size);
++	const struct flash_info *info = nor->info;
+ 
++	if (nor->jedec_id == CFI_MFR_ATMEL ||
++	    nor->jedec_id == CFI_MFR_INTEL ||
++	    nor->jedec_id == CFI_MFR_SST ||
++	    nor->flags & SNOR_F_HAS_LOCK) {
++		if (info->flags & SST_GLOBAL_PROT_UNLK) {
++			spi_nor_prot_unlock(nor);
++		} else {
++			return spi_nor_unlock(&nor->mtd, 0, nor->params->size);
++		}
++	}
+ 	return 0;
+ }
+ 

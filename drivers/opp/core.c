@@ -1894,6 +1894,8 @@ struct opp_table *dev_pm_opp_set_clkname(struct device *dev, const char *name)
 
 	return opp_table;
 
+remove_opp_dev:
+	_remove_opp_dev(opp_dev, opp_table);
 err:
 	dev_pm_opp_put_opp_table(opp_table);
 

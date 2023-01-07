@@ -168,6 +168,11 @@
 #define ECC_ERRCNT_UECNT_SHIFT		16
 #define ECC_ERRCNT_CECNT_MASK		0xFFFF
 
+/* ECC error count register definitions */
+#define ECC_ERRCNT_UECNT_MASK		0xFFFF0000
+#define ECC_ERRCNT_UECNT_SHIFT		16
+#define ECC_ERRCNT_CECNT_MASK		0xFFFF
+
 /* DDR QOS Interrupt register definitions */
 #define DDR_QOS_IRQ_STAT_OFST		0x20200
 #define DDR_QOSUE_MASK			0x4
@@ -497,7 +502,7 @@ static void handle_error(struct mem_ctl_info *mci, struct synps_ecc_status *p)
 		}
 
 		edac_mc_handle_error(HW_EVENT_ERR_CORRECTED, mci,
-				     p->ce_cnt, 0, 0, 0, 0, 0, -1,
+				     priv->ce_cnt, 0, 0, 0, 0, 0, -1,
 				     priv->message, "");
 	}
 
@@ -515,7 +520,7 @@ static void handle_error(struct mem_ctl_info *mci, struct synps_ecc_status *p)
 		}
 
 		edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci,
-				     p->ue_cnt, 0, 0, 0, 0, 0, -1,
+				     priv->ue_cnt, 0, 0, 0, 0, 0, -1,
 				     priv->message, "");
 	}
 
@@ -1350,7 +1355,8 @@ static int mc_probe(struct platform_device *pdev)
 
 #ifdef CONFIG_EDAC_DEBUG
 	if (priv->p_data->quirks & DDR_ECC_DATA_POISON_SUPPORT) {
-		if (edac_create_sysfs_attributes(mci)) {
+		rc = edac_create_sysfs_attributes(mci);
+		if (rc) {
 			edac_printk(KERN_ERR, EDAC_MC,
 					"Failed to create sysfs entries\n");
 			goto free_edac_mc;

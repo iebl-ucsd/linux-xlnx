@@ -33,7 +33,7 @@ static struct spi_nor_fixups w25q256_fixups = {
 	.post_bfpt = w25q256_post_bfpt_fixups,
 };
 
-static const struct flash_info winbond_parts[] = {
+static struct flash_info winbond_parts[] = {
 	/* Winbond -- w25x "blocks" are 64K, "sectors" are 4KiB */
 	{ "w25x05", INFO(0xef3010, 0, 64 * 1024,  1,  SECT_4K) },
 	{ "w25x10", INFO(0xef3011, 0, 64 * 1024,  2,  SECT_4K) },
@@ -97,6 +97,11 @@ static const struct flash_info winbond_parts[] = {
 			     SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ) },
 	{ "w25m512jv", INFO(0xef7119, 0, 64 * 1024, 1024,
 			    SECT_4K | SPI_NOR_QUAD_READ | SPI_NOR_DUAL_READ) },
+	{ "w25h02jv", INFO(0xef9022, 0, 64 * 1024, 4096,
+			    SECT_4K | SPI_NOR_QUAD_READ | SPI_NOR_DUAL_READ |
+			    SPI_NOR_HAS_LOCK | SPI_NOR_HAS_TB |
+			    SPI_NOR_TB_SR_BIT6 | SPI_NOR_4BIT_BP |
+			    SPI_NOR_BP3_SR_BIT5) },
 };
 
 /**

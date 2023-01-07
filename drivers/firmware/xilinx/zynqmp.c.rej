@@ -1,0 +1,11 @@
+--- drivers/firmware/xilinx/zynqmp.c
++++ drivers/firmware/xilinx/zynqmp.c
+@@ -2,7 +2,7 @@
+ /*
+  * Xilinx Zynq MPSoC Firmware layer
+  *
+- *  Copyright (C) 2014-2020 Xilinx, Inc.
++ *  Copyright (C) 2014-2021 Xilinx, Inc.
+  *
+  *  Michal Simek <michal.simek@xilinx.com>
+  *  Davorin Mista <davorin.mista@aggios.com>

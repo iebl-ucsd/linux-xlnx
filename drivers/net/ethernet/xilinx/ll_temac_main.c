@@ -797,6 +797,12 @@ static void temac_start_xmit_done(struct net_device *ndev)
 		smp_mb();
 		cur_p->app0 = 0;
 
+		/* app0 must be visible last, as it is used to flag
+		 * availability of the bd
+		 */
+		smp_mb();
+		cur_p->app0 = 0;
+
 		lp->tx_bd_ci++;
 		if (lp->tx_bd_ci >= lp->tx_bd_num)
 			lp->tx_bd_ci = 0;
@@ -822,6 +828,9 @@ static inline int temac_check_tx_bd_space(struct temac_local *lp, int num_frag)
 	do {
 		if (cur_p->app0)
 			return NETDEV_TX_BUSY;
+
+		/* Make sure to read next bd app0 after this one */
+		rmb();
 
 		/* Make sure to read next bd app0 after this one */
 		rmb();
@@ -925,6 +934,11 @@ temac_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 		frag++;
 	}
 	cur_p->app0 |= cpu_to_be32(STS_CTRL_APP0_EOP);
+
+	/* Mark last fragment with skb address, so it can be consumed
+	 * in temac_start_xmit_done()
+	 */
+	ptr_to_txbd((void *)skb, cur_p);
 
 	/* Mark last fragment with skb address, so it can be consumed
 	 * in temac_start_xmit_done()

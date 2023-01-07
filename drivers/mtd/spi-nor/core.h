@@ -26,6 +26,7 @@ enum spi_nor_option_flags {
 	SNOR_F_HAS_SR_TB_BIT6	= BIT(11),
 	SNOR_F_HAS_4BIT_BP      = BIT(12),
 	SNOR_F_HAS_SR_BP3_BIT6  = BIT(13),
+	SNOR_F_HAS_SR_BP3_BIT5  = BIT(14),
 };
 
 struct spi_nor_read_command {
@@ -311,7 +312,15 @@ struct flash_info {
 					 * BP3 is bit 6 of status register.
 					 * Must be used with SPI_NOR_4BIT_BP.
 					 */
-
+#define SPI_NOR_OCTAL_WRITE     BIT(19)
+#define	SST_GLOBAL_PROT_UNLK	BIT(16)	/* Unlock the Global protection for
+					 * sst flashes
+					 */
+#define SPI_NOR_BP3_SR_BIT5	BIT(20) /*
+					 * BP3 is bit 5 of status register.
+					 * Must be used with SPI_NOR_4BIT_BP.
+					 */
+	int	(*quad_enable)(struct spi_nor *nor);
 	/* Part specific fixup hooks. */
 	const struct spi_nor_fixups *fixups;
 };
@@ -402,7 +411,7 @@ extern const struct spi_nor_manufacturer spi_nor_xmc;
 int spi_nor_write_enable(struct spi_nor *nor);
 int spi_nor_write_disable(struct spi_nor *nor);
 int spi_nor_set_4byte_addr_mode(struct spi_nor *nor, bool enable);
-int spi_nor_write_ear(struct spi_nor *nor, u8 ear);
+int spi_nor_write_ear(struct spi_nor *nor, u32 addr);
 int spi_nor_wait_till_ready(struct spi_nor *nor);
 int spi_nor_lock_and_prep(struct spi_nor *nor);
 void spi_nor_unlock_and_unprep(struct spi_nor *nor);
@@ -438,5 +447,8 @@ static struct spi_nor __maybe_unused *mtd_to_spi_nor(struct mtd_info *mtd)
 {
 	return mtd->priv;
 }
+
+int sst_write(struct mtd_info *mtd, loff_t to, size_t len,
+	      size_t *retlen, const u_char *buf);
 
 #endif /* __LINUX_MTD_SPI_NOR_INTERNAL_H */
