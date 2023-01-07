@@ -772,6 +772,24 @@ static int dp83867_config_init(struct phy_device *phydev)
 			val &= ~DP83867_SGMII_TYPE;
 		phy_write_mmd(phydev, DP83867_DEVADDR, DP83867_SGMIICTL, val);
 
+	        phy_write(phydev, MII_BMCR,
+                          (BMCR_ANENABLE | BMCR_FULLDPLX | BMCR_SPEED1000));
+                cfg2 = phy_read(phydev, DP83867_CFG2);
+                cfg2 &= MII_DP83867_CFG2_MASK;
+                cfg2 |= (MII_DP83867_CFG2_SPEEDOPT_10EN |
+                         MII_DP83867_CFG2_SGMII_AUTONEGEN |
+                         MII_DP83867_CFG2_SPEEDOPT_ENH |
+                         MII_DP83867_CFG2_SPEEDOPT_CNT |
+                         MII_DP83867_CFG2_SPEEDOPT_INTLOW);
+                phy_write(phydev, DP83867_CFG2, cfg2);
+                phy_write_mmd(phydev, DP83867_DEVADDR, DP83867_RGMIICTL, 0x0);
+                phy_write(phydev, MII_DP83867_PHYCTRL,
+                          DP83867_PHYCTRL_SGMIIEN |
+                          (DP83867_MDI_CROSSOVER_AUTO << DP83867_MDI_CROSSOVER) |
+                          (dp83867->rx_fifo_depth << DP83867_PHYCTRL_RXFIFO_SHIFT) |
+                          (dp83867->tx_fifo_depth  << DP83867_PHYCTRL_TXFIFO_SHIFT));
+                phy_write(phydev, MII_DP83867_BISCR, 0x0);
+
 		/* This is a SW workaround for link instability if RX_CTRL is
 		 * not strapped to mode 3 or 4 in HW. This is required for SGMII
 		 * in addition to clearing bit 7, handled above.
