@@ -3543,13 +3543,19 @@ static void spi_nor_prot_unlock(struct spi_nor *nor)
 static void spi_nor_try_unlock_all(struct spi_nor *nor)
 {
 	int ret;
-
-	if (!(nor->flags & SNOR_F_HAS_LOCK))
-		return;
-
-	ret = spi_nor_unlock(&nor->mtd, 0, nor->params->size);
-	if (ret)
-		dev_dbg(nor->dev, "Failed to unlock the entire flash memory array\n");
+	const struct flash_info *info = nor->info;
+        if (nor->jedec_id == CFI_MFR_ATMEL ||
+            nor->jedec_id == CFI_MFR_INTEL ||
+            nor->jedec_id == CFI_MFR_SST ||
+            nor->flags & SNOR_F_HAS_LOCK) {
+		if (info->flags & SST_GLOBAL_PROT_UNLK) {
+			spi_nor_prot_unlock(nor);
+		} else {
+			ret = spi_nor_unlock(&nor->mtd, 0, nor->params->size);
+			if (ret)
+				dev_dbg(nor->dev, "Failed to unlock the entire flash memory array\n");
+		}
+        }
 }
 
 static int spi_nor_init(struct spi_nor *nor)
