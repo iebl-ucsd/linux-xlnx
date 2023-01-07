@@ -691,9 +691,12 @@ static int cqspi_read_setup(struct cqspi_flash_pdata *f_pdata,
 	reg |= cqspi_calc_rdreg(f_pdata);
 
 	/* Setup dummy clock cycles */
-	dummy_clk = op->dummy.nbytes * 8;
+	dummy_clk = (op->dummy.nbytes * 8) / op->dummy.buswidth;
 	if (dummy_clk > CQSPI_DUMMY_CLKS_MAX)
 		return -EOPNOTSUPP;
+
+	if (cqspi->extra_dummy)
+		dummy_clk++;
 
 	if (dummy_clk)
 		reg |= (dummy_clk & CQSPI_REG_RD_INSTR_DUMMY_MASK)
