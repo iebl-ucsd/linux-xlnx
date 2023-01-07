@@ -823,7 +823,6 @@ static int xemaclite_mdio_setup(struct net_local *lp, struct device *dev)
 	}
 	if (lp->ndev->mem_start != res.start) {
 		struct phy_device *phydev;
-
 		phydev = of_phy_find_device(lp->phy_node);
 		if (!phydev)
 			dev_info(dev,
@@ -1166,8 +1165,8 @@ static int xemaclite_of_probe(struct platform_device *ofdev)
 	}
 
 	dev_info(dev,
-		 "Xilinx EmacLite at 0x%08lX mapped to 0x%p, irq=%d\n",
-		 (unsigned long __force)ndev->mem_start, lp->base_addr, ndev->irq);
+		 "Xilinx EmacLite at 0x%08X mapped to 0x%p, irq=%d\n",
+		 (unsigned int __force)ndev->mem_start, lp->base_addr, ndev->irq);
 	return 0;
 
 put_node:
