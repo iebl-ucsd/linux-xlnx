@@ -358,6 +358,7 @@ smb2_compound_op(const unsigned int xid, struct cifs_tcon *tcon,
 	if (cfile)
 		goto after_close;
 	/* Close */
+	flags |= CIFS_CP_CREATE_CLOSE_OP;
 	rqst[num_rqst].rq_iov = &vars->close_iov[0];
 	rqst[num_rqst].rq_nvec = 1;
 	rc = SMB2_close_init(tcon, server,
@@ -370,8 +371,6 @@ smb2_compound_op(const unsigned int xid, struct cifs_tcon *tcon,
 	num_rqst++;
 
 	if (cfile) {
-		cifsFileInfo_put(cfile);
-		cfile = NULL;
 		rc = compound_send_recv(xid, ses, server,
 					flags, num_rqst - 2,
 					&rqst[1], &resp_buftype[1],

@@ -706,6 +706,8 @@ static void mlx5e_build_rep_params(struct net_device *netdev)
 
 	params->num_tc                = 1;
 	params->tunneled_offload_en = false;
+	if (rep->vport != MLX5_VPORT_UPLINK)
+		params->vlan_strip_disable = true;
 
 	mlx5_query_min_inline(mdev, &params->tx_min_inline_mode);
 
@@ -738,7 +740,9 @@ static void mlx5e_build_rep_netdev(struct net_device *netdev)
 
 	netdev->features       |= NETIF_F_NETNS_LOCAL;
 
+#if IS_ENABLED(CONFIG_MLX5_CLS_ACT)
 	netdev->hw_features    |= NETIF_F_HW_TC;
+#endif
 	netdev->hw_features    |= NETIF_F_SG;
 	netdev->hw_features    |= NETIF_F_IP_CSUM;
 	netdev->hw_features    |= NETIF_F_IPV6_CSUM;

@@ -108,14 +108,14 @@ static int usb4_do_read_data(u16 address, void *buf, size_t size,
 	unsigned int retries = USB4_DATA_RETRIES;
 	unsigned int offset;
 
-	offset = address & 3;
-	address = address & ~3;
-
 	do {
-		size_t nbytes = min_t(size_t, size, USB4_DATA_DWORDS * 4);
 		unsigned int dwaddress, dwords;
 		u8 data[USB4_DATA_DWORDS * 4];
+		size_t nbytes;
 		int ret;
+
+		offset = address & 3;
+		nbytes = min_t(size_t, size + offset, USB4_DATA_DWORDS * 4);
 
 		dwaddress = address / 4;
 		dwords = ALIGN(nbytes, 4) / 4;
@@ -127,6 +127,7 @@ static int usb4_do_read_data(u16 address, void *buf, size_t size,
 			return ret;
 		}
 
+		nbytes -= offset;
 		memcpy(buf, data + offset, nbytes);
 
 		size -= nbytes;
@@ -851,6 +852,26 @@ int usb4_port_unlock(struct tb_port *port)
 
 	val &= ~ADP_CS_4_LCK;
 	return tb_port_write(port, &val, TB_CFG_PORT, ADP_CS_4, 1);
+}
+
+/**
+ * usb4_port_hotplug_enable() - Enables hotplug for a port
+ * @port: USB4 port to operate on
+ *
+ * Enables hot plug events on a given port. This is only intended
+ * to be used on lane, DP-IN, and DP-OUT adapters.
+ */
+int usb4_port_hotplug_enable(struct tb_port *port)
+{
+	int ret;
+	u32 val;
+
+	ret = tb_port_read(port, &val, TB_CFG_PORT, ADP_CS_5, 1);
+	if (ret)
+		return ret;
+
+	val &= ~ADP_CS_5_DHP;
+	return tb_port_write(port, &val, TB_CFG_PORT, ADP_CS_5, 1);
 }
 
 static int usb4_port_set_configured(struct tb_port *port, bool configured)

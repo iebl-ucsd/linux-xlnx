@@ -44,6 +44,7 @@ static inline unsigned long pte_index(unsigned long address)
 {
 	return (address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
 }
+#define pte_index pte_index
 
 #ifndef pmd_index
 static inline unsigned long pmd_index(unsigned long address)
@@ -855,6 +856,10 @@ static inline void ptep_modify_prot_commit(struct vm_area_struct *vma,
 
 #ifndef pgprot_device
 #define pgprot_device pgprot_noncached
+#endif
+
+#ifndef pgprot_mhp
+#define pgprot_mhp(prot)	(prot)
 #endif
 
 #ifdef CONFIG_MMU

@@ -171,7 +171,7 @@ static void call_rcu_tasks_generic(struct rcu_head *rhp, rcu_callback_t func,
 static void synchronize_rcu_tasks_generic(struct rcu_tasks *rtp)
 {
 	/* Complain if the scheduler has not started.  */
-	RCU_LOCKDEP_WARN(rcu_scheduler_active == RCU_SCHEDULER_INACTIVE,
+	WARN_ONCE(rcu_scheduler_active == RCU_SCHEDULER_INACTIVE,
 			 "synchronize_rcu_tasks called too soon");
 
 	/* Wait for the grace period. */
@@ -197,6 +197,7 @@ static int __noreturn rcu_tasks_kthread(void *arg)
 	 * This loop is terminated by the system going down.  ;-)
 	 */
 	for (;;) {
+		set_tasks_gp_state(rtp, RTGS_WAIT_CBS);
 
 		/* Pick up any new callbacks. */
 		raw_spin_lock_irqsave(&rtp->cbs_lock, flags);
@@ -236,12 +237,10 @@ static int __noreturn rcu_tasks_kthread(void *arg)
 		}
 		/* Paranoid sleep to keep this from entering a tight loop */
 		schedule_timeout_idle(rtp->gp_sleep);
-
-		set_tasks_gp_state(rtp, RTGS_WAIT_CBS);
 	}
 }
 
-/* Spawn RCU-tasks grace-period kthread, e.g., at core_initcall() time. */
+/* Spawn RCU-tasks grace-period kthread. */
 static void __init rcu_spawn_tasks_kthread_generic(struct rcu_tasks *rtp)
 {
 	struct task_struct *t;
@@ -569,7 +568,6 @@ static int __init rcu_spawn_tasks_kthread(void)
 	rcu_spawn_tasks_kthread_generic(&rcu_tasks);
 	return 0;
 }
-core_initcall(rcu_spawn_tasks_kthread);
 
 #ifndef CONFIG_TINY_RCU
 static void show_rcu_tasks_classic_gp_kthread(void)
@@ -622,6 +620,9 @@ static void rcu_tasks_be_rude(struct work_struct *work)
 // Wait for one rude RCU-tasks grace period.
 static void rcu_tasks_rude_wait_gp(struct rcu_tasks *rtp)
 {
+	if (num_online_cpus() <= 1)
+		return;	// Fastpath for only one CPU.
+
 	rtp->n_ipis += cpumask_weight(cpu_online_mask);
 	schedule_on_each_cpu(rcu_tasks_be_rude);
 }
@@ -697,7 +698,6 @@ static int __init rcu_spawn_tasks_rude_kthread(void)
 	rcu_spawn_tasks_kthread_generic(&rcu_tasks_rude);
 	return 0;
 }
-core_initcall(rcu_spawn_tasks_rude_kthread);
 
 #ifndef CONFIG_TINY_RCU
 static void show_rcu_tasks_rude_gp_kthread(void)
@@ -881,10 +881,9 @@ static bool trc_inspect_reader(struct task_struct *t, void *arg)
 		in_qs = likely(!t->trc_reader_nesting);
 	}
 
-	// Mark as checked.  Because this is called from the grace-period
-	// kthread, also remove the task from the holdout list.
+	// Mark as checked so that the grace-period kthread will
+	// remove it from the holdout list.
 	t->trc_reader_checked = true;
-	trc_del_holdout(t);
 
 	if (in_qs)
 		return true;  // Already in quiescent state, done!!!
@@ -911,7 +910,6 @@ static void trc_wait_for_one_reader(struct task_struct *t,
 	// The current task had better be in a quiescent state.
 	if (t == current) {
 		t->trc_reader_checked = true;
-		trc_del_holdout(t);
 		WARN_ON_ONCE(t->trc_reader_nesting);
 		return;
 	}
@@ -975,6 +973,11 @@ static void rcu_tasks_trace_pregp_step(void)
 static void rcu_tasks_trace_pertask(struct task_struct *t,
 				    struct list_head *hop)
 {
+	// During early boot when there is only the one boot CPU, there
+	// is no idle task for the other CPUs. Just return.
+	if (unlikely(t == NULL))
+		return;
+
 	WRITE_ONCE(t->trc_reader_special.b.need_qs, false);
 	WRITE_ONCE(t->trc_reader_checked, false);
 	t->trc_ipi_to_cpu = -1;
@@ -1200,7 +1203,6 @@ static int __init rcu_spawn_tasks_trace_kthread(void)
 	rcu_spawn_tasks_kthread_generic(&rcu_tasks_trace);
 	return 0;
 }
-core_initcall(rcu_spawn_tasks_trace_kthread);
 
 #ifndef CONFIG_TINY_RCU
 static void show_rcu_tasks_trace_gp_kthread(void)
@@ -1228,6 +1230,21 @@ void show_rcu_tasks_gp_kthreads(void)
 	show_rcu_tasks_trace_gp_kthread();
 }
 #endif /* #ifndef CONFIG_TINY_RCU */
+
+void __init rcu_init_tasks_generic(void)
+{
+#ifdef CONFIG_TASKS_RCU
+	rcu_spawn_tasks_kthread();
+#endif
+
+#ifdef CONFIG_TASKS_RUDE_RCU
+	rcu_spawn_tasks_rude_kthread();
+#endif
+
+#ifdef CONFIG_TASKS_TRACE_RCU
+	rcu_spawn_tasks_trace_kthread();
+#endif
+}
 
 #else /* #ifdef CONFIG_TASKS_RCU_GENERIC */
 static inline void rcu_tasks_bootup_oddness(void) {}

@@ -1639,7 +1639,7 @@ static int safexcel_probe_generic(void *pdev,
 
 		priv->ring[i].rdr_req = devm_kcalloc(dev,
 			EIP197_DEFAULT_RING_SIZE,
-			sizeof(priv->ring[i].rdr_req),
+			sizeof(*priv->ring[i].rdr_req),
 			GFP_KERNEL);
 		if (!priv->ring[i].rdr_req)
 			return -ENOMEM;
@@ -1833,6 +1833,8 @@ static const struct of_device_id safexcel_of_match_table[] = {
 	},
 	{},
 };
+
+MODULE_DEVICE_TABLE(of, safexcel_of_match_table);
 
 static struct platform_driver  crypto_safexcel = {
 	.probe		= safexcel_probe,
