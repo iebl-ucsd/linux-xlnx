@@ -1,0 +1,10 @@
+--- drivers/usb/dwc3/core.h
++++ drivers/usb/dwc3/core.h
+@@ -1030,6 +1033,7 @@ struct dwc3_scratchpad_array {
+  *			not needed for DWC_usb31 version 1.70a-ea06 and below
+  * @usb3_lpm_capable: set if hadrware supports Link Power Management
+  * @usb2_lpm_disable: set to disable usb2 lpm
++ * @remote_wakeup: set if host supports Remote Wakeup from Peripheral
+  * @disable_scramble_quirk: set if we enable the disable scramble quirk
+  * @u2exit_lfps_quirk: set if we enable u2exit lfps quirk
+  * @u2ss_inp3_quirk: set if we enable P3 OK for U2/SS Inactive quirk

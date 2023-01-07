@@ -388,8 +388,8 @@ struct nand_ecc_ctrl {
  * This struct defines the timing requirements of a SDR NAND chip.
  * These information can be found in every NAND datasheets and the timings
  * meaning are described in the ONFI specifications:
- * www.onfi.org/~/media/ONFI/specs/onfi_3_1_spec.pdf (chapter 4.15 Timing
- * Parameters)
+ * https://media-www.micron.com/-/media/client/onfi/specs/onfi_3_1_spec.pdf
+ * (chapter 4.15 Timing Parameters)
  *
  * All these timings are expressed in picoseconds.
  *
@@ -473,6 +473,15 @@ struct nand_sdr_timings {
 	u32 tWP_min;
 	u32 tWW_min;
 };
+
+/**
+ * nand_interface_is_sdr - get the interface type
+ * @conf:	The data interface
+ */
+static bool nand_interface_is_sdr(const struct nand_interface_config *conf)
+{
+	return conf->type == NAND_SDR_IFACE;
+}
 
 /**
  * struct nand_nvddr_timings - NV-DDR NAND chip timings
@@ -560,6 +569,34 @@ struct nand_nvddr_timings {
 	u32 tWW_min;
 };
 
+/*
+ * While timings related to the data interface itself are mostly different
+ * between SDR and NV-DDR, timings related to the internal chip behavior are
+ * common. IOW, the following entries which describe the internal delays have
+ * the same definition and are shared in both SDR and NV-DDR timing structures:
+ * - tADL_min
+ * - tBERS_max
+ * - tCCS_min
+ * - tFEAT_max
+ * - tPROG_max
+ * - tR_max
+ * - tRR_min
+ * - tRST_max
+ * - tWB_max
+ *
+ * The below macros return the value of a given timing, no matter the interface.
+ */
+#define NAND_COMMON_TIMING_PS(conf, timing_name)	\
+	(nand_interface_is_sdr(conf) ?			\
+	 nand_get_sdr_timings(conf)->timing_name :	\
+	 nand_get_nvddr_timings(conf)->timing_name)
+
+#define NAND_COMMON_TIMING_MS(conf, timing_name) \
+	PSEC_TO_MSEC(NAND_COMMON_TIMING_PS((conf), timing_name))
+
+#define NAND_COMMON_TIMING_NS(conf, timing_name) \
+	PSEC_TO_NSEC(NAND_COMMON_TIMING_PS((conf), timing_name))
+
 /**
  * enum nand_interface_type - NAND interface type
  * @NAND_SDR_IFACE:	Single Data Rate interface
@@ -608,6 +645,15 @@ static bool nand_interface_is_nvddr(const struct nand_interface_config *conf)
 }
 
 /**
+ * nand_interface_is_nvddr - get the interface type
+ * @conf:	The data interface
+ */
+static bool nand_interface_is_nvddr(const struct nand_interface_config *conf)
+{
+	return conf->type == NAND_NVDDR_IFACE;
+}
+
+/**
  * nand_get_sdr_timings - get SDR timing from data interface
  * @conf:	The data interface
  */
@@ -618,6 +664,19 @@ nand_get_sdr_timings(const struct nand_interface_config *conf)
 		return ERR_PTR(-EINVAL);
 
 	return &conf->timings.sdr;
+}
+
+/**
+ * nand_get_nvddr_timings - get NV-DDR timing from data interface
+ * @conf:	The data interface
+ */
+static inline const struct nand_nvddr_timings *
+nand_get_nvddr_timings(const struct nand_interface_config *conf)
+{
+	if (!nand_interface_is_nvddr(conf))
+		return ERR_PTR(-EINVAL);
+
+	return &conf->timings.nvddr;
 }
 
 /**
@@ -1408,6 +1467,15 @@ static inline bool nand_is_slc(struct nand_chip *chip)
 	return nanddev_bits_per_cell(&chip->base) == 1;
 }
 
+/* return the supported synchronous timing mode. */
+static inline int onfi_get_sync_timing_mode(struct nand_chip *chip)
+{
+	if (!chip->parameters.onfi)
+		return ONFI_TIMING_MODE_UNKNOWN;
+
+	return le16_to_cpu(chip->parameters.onfi->src_sync_timing_mode);
+}
+
 /**
  * Check if the opcode's address should be sent only on the lower 8 bits
  * @command: opcode to check
@@ -1470,6 +1538,10 @@ int nand_read_page_op(struct nand_chip *chip, unsigned int page,
 int nand_change_read_column_op(struct nand_chip *chip,
 			       unsigned int offset_in_page, void *buf,
 			       unsigned int len, bool force_8bit);
+int nand_check_change_read_column_op(struct nand_chip *chip,
+				     unsigned int offset_in_page, void *buf,
+				     unsigned int len, bool force_8bit,
+				     bool check_only);
 int nand_read_oob_op(struct nand_chip *chip, unsigned int page,
 		     unsigned int offset_in_page, void *buf, unsigned int len);
 int nand_prog_page_begin_op(struct nand_chip *chip, unsigned int page,

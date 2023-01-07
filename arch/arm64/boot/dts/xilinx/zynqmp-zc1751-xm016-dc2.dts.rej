@@ -1,0 +1,20 @@
+--- arch/arm64/boot/dts/xilinx/zynqmp-zc1751-xm016-dc2.dts
++++ arch/arm64/boot/dts/xilinx/zynqmp-zc1751-xm016-dc2.dts
+@@ -198,7 +198,7 @@ spi0_flash0: flash@0 {
+ 		reg = <0>;
+ 
+ 		partition@0 {
+-			label = "data";
++			label = "spi0-data";
+ 			reg = <0x0 0x100000>;
+ 		};
+ 	};
+@@ -216,7 +216,7 @@ spi1_flash0: flash@0 {
+ 		reg = <0>;
+ 
+ 		partition@0 {
+-			label = "data";
++			label = "spi1-data";
+ 			reg = <0x0 0x84000>;
+ 		};
+ 	};

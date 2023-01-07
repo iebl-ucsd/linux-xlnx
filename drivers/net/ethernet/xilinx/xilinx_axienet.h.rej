@@ -1,0 +1,12 @@
+--- drivers/net/ethernet/xilinx/xilinx_axienet.h
++++ drivers/net/ethernet/xilinx/xilinx_axienet.h
+@@ -643,9 +645,6 @@ struct axienet_local {
+ 	/* Connection to PHY device */
+ 	struct device_node *phy_node;
+ 
+-	struct phylink *phylink;
+-	struct phylink_config phylink_config;
+-
+ 	/* Clock for AXI bus */
+ 	struct clk *clk;
+ 

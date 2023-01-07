@@ -1,0 +1,18 @@
+--- arch/arm64/boot/dts/xilinx/zynqmp.dtsi
++++ arch/arm64/boot/dts/xilinx/zynqmp.dtsi
+@@ -975,6 +1225,7 @@ ttc3: timer@ff140000 {
+ 		};
+ 
+ 		uart0: serial@ff000000 {
++			u-boot,dm-pre-reloc;
+ 			compatible = "cdns,uart-r1p12", "xlnx,xuartps";
+ 			status = "disabled";
+ 			interrupt-parent = <&gic>;
+@@ -985,6 +1236,7 @@ uart0: serial@ff000000 {
+ 		};
+ 
+ 		uart1: serial@ff010000 {
++			u-boot,dm-pre-reloc;
+ 			compatible = "cdns,uart-r1p12", "xlnx,xuartps";
+ 			status = "disabled";
+ 			interrupt-parent = <&gic>;

@@ -1,0 +1,21 @@
+--- drivers/usb/host/xhci.h
++++ drivers/usb/host/xhci.h
+@@ -1881,6 +1884,7 @@ struct xhci_hcd {
+ #define XHCI_RENESAS_FW_QUIRK	BIT_ULL(36)
+ #define XHCI_SKIP_PHY_INIT	BIT_ULL(37)
+ #define XHCI_DISABLE_SPARSE	BIT_ULL(38)
++#define XHCI_STREAM_QUIRK	BIT_ULL(39) /* FIXME this is wrong */
+ 
+ 	unsigned int		num_active_eps;
+ 	unsigned int		limit_active_eps;
+--- drivers/usb/host/xhci.h
++++ drivers/usb/host/xhci.h
+@@ -2063,6 +2063,8 @@ void xhci_free_container_ctx(struct xhci_hcd *xhci,
+ 
+ /* xHCI host controller glue */
+ typedef void (*xhci_get_quirks_t)(struct device *, struct xhci_hcd *);
++typedef void (*host_wakeup_t)(struct device *dev, bool wakeup);
++void dwc3_host_wakeup_capable(struct device *dev, bool wakeup);
+ int xhci_handshake(void __iomem *ptr, u32 mask, u32 done, int usec);
+ void xhci_quiesce(struct xhci_hcd *xhci);
+ int xhci_halt(struct xhci_hcd *xhci);

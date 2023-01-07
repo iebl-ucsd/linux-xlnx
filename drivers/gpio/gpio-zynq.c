@@ -741,6 +741,11 @@ static int __maybe_unused zynq_gpio_suspend(struct device *dev)
 		return -EINVAL;
 	}
 
+	if (!data) {
+		dev_err(dev, "irq_get_irq_data() failed\n");
+		return -EINVAL;
+	}
+
 	if (!device_may_wakeup(dev))
 		disable_irq(gpio->irq);
 
@@ -757,6 +762,11 @@ static int __maybe_unused zynq_gpio_resume(struct device *dev)
 	struct zynq_gpio *gpio = dev_get_drvdata(dev);
 	struct irq_data *data = irq_get_irq_data(gpio->irq);
 	int ret;
+
+	if (!data) {
+		dev_err(dev, "irq_get_irq_data() failed\n");
+		return -EINVAL;
+	}
 
 	if (!data) {
 		dev_err(dev, "irq_get_irq_data() failed\n");
@@ -1033,22 +1043,7 @@ static struct platform_driver zynq_gpio_driver = {
 	.remove = zynq_gpio_remove,
 };
 
-/**
- * zynq_gpio_init - Initial driver registration call
- *
- * Return: value from platform_driver_register
- */
-static int __init zynq_gpio_init(void)
-{
-	return platform_driver_register(&zynq_gpio_driver);
-}
-postcore_initcall(zynq_gpio_init);
-
-static void __exit zynq_gpio_exit(void)
-{
-	platform_driver_unregister(&zynq_gpio_driver);
-}
-module_exit(zynq_gpio_exit);
+module_platform_driver(zynq_gpio_driver);
 
 MODULE_AUTHOR("Xilinx Inc.");
 MODULE_DESCRIPTION("Zynq GPIO driver");

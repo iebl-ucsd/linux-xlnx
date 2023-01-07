@@ -1,0 +1,23 @@
+--- drivers/dma/xilinx/zynqmp_dma.c
++++ drivers/dma/xilinx/zynqmp_dma.c
+@@ -468,7 +468,7 @@ static int zynqmp_dma_alloc_chan_resources(struct dma_chan *dchan)
+ 	struct zynqmp_dma_desc_sw *desc;
+ 	int i, ret;
+ 
+-	ret = pm_runtime_get_sync(chan->dev);
++	ret = pm_runtime_resume_and_get(chan->dev);
+ 	if (ret < 0)
+ 		return ret;
+ 
+--- drivers/dma/xilinx/zynqmp_dma.c
++++ drivers/dma/xilinx/zynqmp_dma.c
+@@ -491,7 +491,8 @@ static int zynqmp_dma_alloc_chan_resources(struct dma_chan *dchan)
+ 	}
+ 
+ 	chan->desc_pool_v = dma_alloc_coherent(chan->dev,
+-					       (2 * chan->desc_size * ZYNQMP_DMA_NUM_DESCS),
++					       ((size_t)(2 * chan->desc_size) *
++						ZYNQMP_DMA_NUM_DESCS),
+ 					       &chan->desc_pool_p, GFP_KERNEL);
+ 	if (!chan->desc_pool_v)
+ 		return -ENOMEM;

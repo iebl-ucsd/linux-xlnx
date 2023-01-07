@@ -1,0 +1,267 @@
+--- drivers/gpu/drm/xlnx/zynqmp_dp.c
++++ drivers/gpu/drm/xlnx/zynqmp_dp.c
+@@ -398,11 +394,8 @@ static int zynqmp_dp_phy_init(struct zynqmp_dp *dp)
+ 		}
+ 	}
+ 
+-	ret = zynqmp_dp_reset(dp, false);
+-	if (ret < 0)
+-		return ret;
+-
+-	zynqmp_dp_clr(dp, ZYNQMP_DP_PHY_RESET, ZYNQMP_DP_PHY_RESET_ALL_RESET);
++	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_SUB_TX_INTR_DS, ZYNQMP_DP_TX_INTR_ALL);
++	zynqmp_dp_clr(dp->iomem, ZYNQMP_DP_TX_PHY_CONFIG, ZYNQMP_DP_TX_PHY_CONFIG_ALL_RESET);
+ 
+ 	/*
+ 	 * Power on lanes in reverse order as only lane 0 waits for the PLL to
+@@ -437,8 +430,6 @@ static void zynqmp_dp_phy_exit(struct zynqmp_dp *dp)
+ 				ret);
+ 	}
+ 
+-	zynqmp_dp_reset(dp, true);
+-
+ 	for (i = 0; i < dp->num_lanes; i++) {
+ 		ret = phy_exit(dp->phy[i]);
+ 		if (ret)
+@@ -946,27 +1041,28 @@ static int zynqmp_dp_train(struct zynqmp_dp *dp)
+ 		return ret;
+ 	}
+ 
+-	zynqmp_dp_write(dp, ZYNQMP_DP_LINK_BW_SET, bw_code);
++	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_TX_LINK_BW_SET, bw_code);
+ 	switch (bw_code) {
+ 	case DP_LINK_BW_1_62:
+-		reg = ZYNQMP_DP_PHY_CLOCK_SELECT_1_62G;
++		reg = ZYNQMP_DP_TX_PHY_CLOCK_FEEDBACK_SETTING_162;
+ 		break;
+ 	case DP_LINK_BW_2_7:
+-		reg = ZYNQMP_DP_PHY_CLOCK_SELECT_2_70G;
++		reg = ZYNQMP_DP_TX_PHY_CLOCK_FEEDBACK_SETTING_270;
+ 		break;
+ 	case DP_LINK_BW_5_4:
+ 	default:
+-		reg = ZYNQMP_DP_PHY_CLOCK_SELECT_5_40G;
++		reg = ZYNQMP_DP_TX_PHY_CLOCK_FEEDBACK_SETTING_540;
+ 		break;
+ 	}
+ 
+-	zynqmp_dp_write(dp, ZYNQMP_DP_PHY_CLOCK_SELECT, reg);
++	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_TX_PHY_CLOCK_FEEDBACK_SETTING,
++			reg);
+ 	ret = zynqmp_dp_phy_ready(dp);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	zynqmp_dp_write(dp, ZYNQMP_DP_SCRAMBLING_DISABLE, 1);
+-	memset(dp->train_set, 0, 4);
++	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_TX_SCRAMBLING_DISABLE, 1);
++	memset(dp->train_set, 0, ARRAY_SIZE(dp->train_set));
+ 	ret = zynqmp_dp_link_train_cr(dp);
+ 	if (ret)
+ 		return ret;
+@@ -1869,139 +2133,98 @@ static irqreturn_t zynqmp_dp_irq_handler(int irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
+-/* -----------------------------------------------------------------------------
+- * Initialization & Cleanup
+- */
+-
+-int zynqmp_dp_drm_init(struct zynqmp_dpsub *dpsub)
+-{
+-	struct zynqmp_dp *dp = dpsub->dp;
+-	struct drm_encoder *encoder = &dp->encoder;
+-	struct drm_connector *connector = &dp->connector;
+-	int ret;
+-
+-	dp->config.misc0 &= ~ZYNQMP_DP_MAIN_STREAM_MISC0_SYNC_LOCK;
+-	zynqmp_dp_set_format(dp, ZYNQMP_DPSUB_FORMAT_RGB, 8);
+-
+-	/* Create the DRM encoder and connector. */
+-	encoder->possible_crtcs |= zynqmp_disp_get_crtc_mask(dpsub->disp);
+-	drm_simple_encoder_init(dp->drm, encoder, DRM_MODE_ENCODER_TMDS);
+-	drm_encoder_helper_add(encoder, &zynqmp_dp_encoder_helper_funcs);
+-
+-	connector->polled = DRM_CONNECTOR_POLL_HPD;
+-	ret = drm_connector_init(encoder->dev, connector,
+-				 &zynqmp_dp_connector_funcs,
+-				 DRM_MODE_CONNECTOR_DisplayPort);
+-	if (ret) {
+-		dev_err(dp->dev, "failed to create the DRM connector\n");
+-		return ret;
+-	}
+-
+-	drm_connector_helper_add(connector, &zynqmp_dp_connector_helper_funcs);
+-	drm_connector_register(connector);
+-	drm_connector_attach_encoder(connector, encoder);
+-
+-	/* Initialize and register the AUX adapter. */
+-	ret = zynqmp_dp_aux_init(dp);
+-	if (ret) {
+-		dev_err(dp->dev, "failed to initialize DP aux\n");
+-		return ret;
+-	}
+-
+-	/* Now that initialisation is complete, enable interrupts. */
+-	zynqmp_dp_write(dp, ZYNQMP_DP_INT_EN, ZYNQMP_DP_INT_ALL);
+-
+-	return 0;
+-}
+-
+-int zynqmp_dp_probe(struct zynqmp_dpsub *dpsub, struct drm_device *drm)
++int zynqmp_dp_probe(struct platform_device *pdev)
+ {
+-	struct platform_device *pdev = to_platform_device(dpsub->dev);
++	struct zynqmp_dpsub *dpsub;
+ 	struct zynqmp_dp *dp;
+ 	struct resource *res;
+-	int ret;
++	struct device_node *port;
++	int irq, ret;
+ 
+-	dp = drmm_kzalloc(drm, sizeof(*dp), GFP_KERNEL);
++	dp = devm_kzalloc(&pdev->dev, sizeof(*dp), GFP_KERNEL);
+ 	if (!dp)
+ 		return -ENOMEM;
+ 
+-	dp->dev = &pdev->dev;
+-	dp->dpsub = dpsub;
++	dp->dpms = DRM_MODE_DPMS_OFF;
+ 	dp->status = connector_status_disconnected;
+-	dp->drm = drm;
+-
+-	INIT_DELAYED_WORK(&dp->hpd_work, zynqmp_dp_hpd_work_func);
+-
+-	dpsub->dp = dp;
++	dp->dev = &pdev->dev;
+ 
+-	/* Acquire all resources (IOMEM, IRQ and PHYs). */
+ 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dp");
+ 	dp->iomem = devm_ioremap_resource(dp->dev, res);
+ 	if (IS_ERR(dp->iomem))
+ 		return PTR_ERR(dp->iomem);
+ 
+-	dp->irq = platform_get_irq(pdev, 0);
+-	if (dp->irq < 0)
+-		return dp->irq;
+-
+-	dp->reset = devm_reset_control_get(dp->dev, NULL);
+-	if (IS_ERR(dp->reset)) {
+-		if (PTR_ERR(dp->reset) != -EPROBE_DEFER)
+-			dev_err(dp->dev, "failed to get reset: %ld\n",
+-				PTR_ERR(dp->reset));
+-		return PTR_ERR(dp->reset);
+-	}
++	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_TX_PHY_POWER_DOWN,
++			ZYNQMP_DP_TX_PHY_POWER_DOWN_ALL);
++	zynqmp_dp_set(dp->iomem, ZYNQMP_DP_TX_PHY_CONFIG,
++		      ZYNQMP_DP_TX_PHY_CONFIG_ALL_RESET);
++	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_TX_FORCE_SCRAMBLER_RESET, 1);
++	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_TX_ENABLE, 0);
+ 
+ 	ret = zynqmp_dp_phy_probe(dp);
+ 	if (ret)
+ 		return ret;
+ 
+-	/* Initialize the hardware. */
+-	zynqmp_dp_write(dp, ZYNQMP_DP_TX_PHY_POWER_DOWN,
+-			ZYNQMP_DP_TX_PHY_POWER_DOWN_ALL);
+-	zynqmp_dp_set(dp, ZYNQMP_DP_PHY_RESET, ZYNQMP_DP_PHY_RESET_ALL_RESET);
+-	zynqmp_dp_write(dp, ZYNQMP_DP_FORCE_SCRAMBLER_RESET, 1);
+-	zynqmp_dp_write(dp, ZYNQMP_DP_TRANSMITTER_ENABLE, 0);
+-	zynqmp_dp_write(dp, ZYNQMP_DP_INT_DS, 0xffffffff);
+-
+ 	ret = zynqmp_dp_phy_init(dp);
+ 	if (ret)
+-		return ret;
++		goto error_phy;
++
++	dp->aux.name = "ZynqMP DP AUX";
++	dp->aux.dev = dp->dev;
++	dp->aux.transfer = zynqmp_dp_aux_transfer;
++	ret = drm_dp_aux_register(&dp->aux);
++	if (ret < 0) {
++		dev_err(dp->dev, "failed to initialize DP aux\n");
++		goto error;
++	}
+ 
+-	zynqmp_dp_write(dp, ZYNQMP_DP_TRANSMITTER_ENABLE, 1);
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		ret = irq;
++		goto error;
++	}
+ 
+-	/*
+-	 * Now that the hardware is initialized and won't generate spurious
+-	 * interrupts, request the IRQ.
+-	 */
+-	ret = devm_request_threaded_irq(dp->dev, dp->irq, NULL,
++	ret = devm_request_threaded_irq(dp->dev, irq, NULL,
+ 					zynqmp_dp_irq_handler, IRQF_ONESHOT,
+ 					dev_name(dp->dev), dp);
+ 	if (ret < 0)
+ 		goto error;
++	dp->irq = irq;
+ 
+-	dev_dbg(dp->dev, "ZynqMP DisplayPort Tx probed with %u lanes\n",
++	dpsub = platform_get_drvdata(pdev);
++	dpsub->dp = dp;
++	dp->dpsub = dpsub;
++
++	for_each_child_of_node(pdev->dev.of_node, port) {
++		if (!port->name || of_node_cmp(port->name, "port"))
++			continue;
++
++		dpsub->external_crtc_attached = true;
++		break;
++	}
++
++	dev_dbg(dp->dev,
++		"ZynqMP DisplayPort Tx driver probed with %u phy lanes\n",
+ 		dp->num_lanes);
+ 
+ 	return 0;
+ 
+ error:
++	drm_dp_aux_unregister(&dp->aux);
++error_phy:
+ 	zynqmp_dp_phy_exit(dp);
+ 	return ret;
+ }
+ 
+-void zynqmp_dp_remove(struct zynqmp_dpsub *dpsub)
++int zynqmp_dp_remove(struct platform_device *pdev)
+ {
++	struct zynqmp_dpsub *dpsub = platform_get_drvdata(pdev);
+ 	struct zynqmp_dp *dp = dpsub->dp;
+ 
+-	zynqmp_dp_write(dp, ZYNQMP_DP_INT_DS, ZYNQMP_DP_INT_ALL);
+-	disable_irq(dp->irq);
+-
+-	cancel_delayed_work_sync(&dp->hpd_work);
+-	zynqmp_dp_aux_cleanup(dp);
+-
+-	zynqmp_dp_write(dp, ZYNQMP_DP_TRANSMITTER_ENABLE, 0);
+-	zynqmp_dp_write(dp, ZYNQMP_DP_INT_DS, 0xffffffff);
+-
++	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_TX_ENABLE, 0);
++	drm_dp_aux_unregister(&dp->aux);
+ 	zynqmp_dp_phy_exit(dp);
++	dpsub->dp = NULL;
++
++	return 0;
+ }
+--- drivers/gpu/drm/xlnx/zynqmp_dp.c
++++ drivers/gpu/drm/xlnx/zynqmp_dp.c
+@@ -430,6 +462,10 @@ static int zynqmp_dp_phy_init(struct zynqmp_dp *dp)
+ 		}
+ 	}
+ 
++	ret = zynqmp_dp_reset(dp, false);
++	if (ret < 0)
++		return ret;
++
+ 	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_SUB_TX_INTR_DS, ZYNQMP_DP_TX_INTR_ALL);
+ 	zynqmp_dp_clr(dp->iomem, ZYNQMP_DP_TX_PHY_CONFIG, ZYNQMP_DP_TX_PHY_CONFIG_ALL_RESET);
+ 
