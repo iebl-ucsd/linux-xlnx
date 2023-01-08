@@ -102,8 +102,6 @@ static long zynqmp_pll_round_rate(struct clk_hw *hw, unsigned long rate,
 				  unsigned long *prate)
 {
 	u32 fbdiv;
-	u32 mult, div;
-
 	/* Let rate fall inside the range PS_PLL_VCO_MIN ~ PS_PLL_VCO_MAX */
 	if (rate > PS_PLL_VCO_MAX) {
 		div = DIV_ROUND_UP(rate, PS_PLL_VCO_MAX);
@@ -128,7 +126,7 @@ static long zynqmp_pll_round_rate(struct clk_hw *hw, unsigned long rate,
  * @hw:			Handle between common and hardware-specific interfaces
  * @parent_rate:	Clock frequency of parent clock
  *
- * Return: Current clock frequency
+ * Return: Current clock frequency or 0 in case of error
  */
 static unsigned long zynqmp_pll_recalc_rate(struct clk_hw *hw,
 					    unsigned long parent_rate)
@@ -140,14 +138,21 @@ static unsigned long zynqmp_pll_recalc_rate(struct clk_hw *hw,
 	unsigned long rate, frac;
 	u32 ret_payload[PAYLOAD_ARG_CNT];
 	int ret;
+	enum pll_mode mode;
 
 	ret = zynqmp_pm_clock_getdivider(clk_id, &fbdiv);
-	if (ret)
+	if (ret) {
 		pr_warn_once("%s() get divider failed for %s, ret = %d\n",
 			     __func__, clk_name, ret);
+		return 0ul;
+	}
+
+	mode = zynqmp_pll_get_mode(hw);
+	if (mode == PLL_MODE_ERROR)
+		return 0ul;
 
 	rate =  parent_rate * fbdiv;
-	if (zynqmp_pll_get_mode(hw) == PLL_MODE_FRAC) {
+	if (mode == PLL_MODE_FRAC) {
 		zynqmp_pm_get_pll_frac_data(clk_id, ret_payload);
 		data = ret_payload[1];
 		frac = (parent_rate * data) / FRAC_DIV;
@@ -274,8 +279,14 @@ static void zynqmp_pll_disable(struct clk_hw *hw)
 	u32 clk_id = clk->clk_id;
 	int ret;
 
-	if (!zynqmp_pll_is_enabled(hw))
+	/*
+	 * Don't skip enabling clock if there is an IOCTL_SET_PLL_FRAC_MODE request
+	 * that has been sent to ATF.
+	 */
+	if (!zynqmp_pll_is_enabled(hw) && (!clk->set_pll_mode))
 		return;
+
+	clk->set_pll_mode = false;
 
 	ret = zynqmp_pm_clock_disable(clk_id);
 	if (ret)
