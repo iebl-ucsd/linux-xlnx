@@ -102,6 +102,7 @@ static long zynqmp_pll_round_rate(struct clk_hw *hw, unsigned long rate,
 				  unsigned long *prate)
 {
 	u32 fbdiv;
+	u32 mult, div;
 	/* Let rate fall inside the range PS_PLL_VCO_MIN ~ PS_PLL_VCO_MAX */
 	if (rate > PS_PLL_VCO_MAX) {
 		div = DIV_ROUND_UP(rate, PS_PLL_VCO_MAX);
