@@ -2514,26 +2514,9 @@ static uint32_t zynqmp_disp_get_format(struct xlnx_crtc *xlnx_crtc)
 
 static unsigned int zynqmp_disp_get_align(struct xlnx_crtc *xlnx_crtc)
 {
-	return 1 << layer->dma->chan->device->copy_align;
-}
-
-static void zynqmp_disp_disable(struct zynqmp_disp *disp)
-{
-	struct drm_crtc *crtc = &disp->crtc;
 	struct zynqmp_disp *disp = xlnx_crtc_to_disp(xlnx_crtc);
-	struct zynqmp_disp_layer *layer = &disp->layers[ZYNQMP_DISP_LAYER_VID];
-
-	zynqmp_disp_audio_disable(&disp->audio);
-
-	zynqmp_disp_avbuf_disable_audio(&disp->avbuf);
-	zynqmp_disp_avbuf_disable_channels(&disp->avbuf);
-	zynqmp_disp_avbuf_disable(&disp->avbuf);
-
-	/* Mark the flip is done as crtc is disabled anyway */
-	if (crtc->state->event) {
-		complete_all(crtc->state->event->base.completion);
-		crtc->state->event = NULL;
-	}
+        struct zynqmp_disp_layer *layer = &disp->layers[ZYNQMP_DISP_LAYER_VID];
+	return 1 << layer->dma->chan->device->copy_align;
 }
 
 static u64 zynqmp_disp_get_dma_mask(struct xlnx_crtc *xlnx_crtc)

@@ -1947,7 +1947,7 @@ int zynqmp_dp_probe(struct platform_device *pdev)
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0) {
 		ret = irq;
-		goto error;
+		goto err_phy_exit;
 	}
 
 	ret = devm_request_threaded_irq(dp->dev, irq, NULL,
