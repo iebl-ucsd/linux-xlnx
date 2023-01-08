@@ -1893,6 +1893,7 @@ struct xhci_hcd {
 #define XHCI_EP_CTX_BROKEN_DCS	BIT_ULL(42)
 #define XHCI_SUSPEND_RESUME_CLKS	BIT_ULL(43)
 #define XHCI_RESET_TO_DEFAULT	BIT_ULL(44)
+#define XHCI_STREAM_QUIRK	BIT_ULL(39) /* FIXME this is wrong */
 
 	unsigned int		num_active_eps;
 	unsigned int		limit_active_eps;
@@ -2076,6 +2077,8 @@ void xhci_free_container_ctx(struct xhci_hcd *xhci,
 
 /* xHCI host controller glue */
 typedef void (*xhci_get_quirks_t)(struct device *, struct xhci_hcd *);
+typedef void (*host_wakeup_t)(struct device *dev, bool wakeup);
+void dwc3_host_wakeup_capable(struct device *dev, bool wakeup);
 int xhci_handshake(void __iomem *ptr, u32 mask, u32 done, u64 timeout_us);
 void xhci_quiesce(struct xhci_hcd *xhci);
 int xhci_halt(struct xhci_hcd *xhci);
