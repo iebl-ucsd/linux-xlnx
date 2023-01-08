@@ -1407,6 +1407,11 @@ sub dump_enum($$) {
     }
 
     if ($members) {
+	if ($identifier ne $members) {
+	    print STDERR "${file}:$.: warning: expecting prototype for enum $identifier. Prototype was for enum $declaration_name instead\n";
+	    return;
+	}
+
 	my %_members;
 
 	$members =~ s/\s+$//;
