@@ -683,7 +683,6 @@ int zynqmp_pm_ospi_mux_select(u32 dev_id, u32 select);
 int zynqmp_pm_get_last_reset_reason(u32 *reset_reason);
 int zynqmp_pm_system_shutdown(const u32 type, const u32 subtype);
 int zynqmp_pm_set_boot_health_status(u32 value);
-#else
 int zynqmp_pm_force_pwrdwn(const u32 target,
 			   const enum zynqmp_pm_request_ack ack);
 int zynqmp_pm_request_wake(const u32 node,
