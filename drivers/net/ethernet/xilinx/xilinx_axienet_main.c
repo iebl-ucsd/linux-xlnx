@@ -38,13 +38,19 @@
 #include <linux/phy.h>
 #include <linux/mii.h>
 #include <linux/ethtool.h>
+#include <linux/iopoll.h>
+#include <linux/ptp_classify.h>
+#include <linux/net_tstamp.h>
+#include <linux/random.h>
+#include <net/sock.h>
+#include <linux/xilinx_phy.h>
+#include <linux/clk.h>
 
 #include "xilinx_axienet.h"
 
 /* Descriptors defines for Tx and Rx DMA */
-#define TX_BD_NUM_DEFAULT		128
-#define RX_BD_NUM_DEFAULT		1024
-#define TX_BD_NUM_MIN			(MAX_SKB_FRAGS + 1)
+#define TX_BD_NUM_DEFAULT		64
+#define RX_BD_NUM_DEFAULT		128
 #define TX_BD_NUM_MAX			4096
 #define RX_BD_NUM_MAX			4096
 
@@ -422,11 +428,115 @@ void axienet_setoptions(struct net_device *ndev, u32 options)
 	lp->options |= options;
 }
 
-static int __axienet_device_reset(struct axienet_local *lp)
+static void xxvenet_setoptions(struct net_device *ndev, u32 options)
 {
-	u32 value;
-	int ret;
+	int reg;
+	struct axienet_local *lp = netdev_priv(ndev);
+	struct xxvenet_option *tp;
 
+	if (lp->axienet_config->mactype == XAXIENET_MRMAC)
+		tp = &mrmacenet_options[0];
+	else
+		tp = &xxvenet_options[0];
+
+	while (tp->opt) {
+		reg = ((axienet_ior(lp, tp->reg)) & ~(tp->m_or));
+		if (options & tp->opt)
+			reg |= tp->m_or;
+		axienet_iow(lp, tp->reg, reg);
+		tp++;
+	}
+
+	lp->options |= options;
+}
+
+static inline void axienet_mrmac_reset(struct axienet_local *lp)
+{
+	u32 val, reg;
+
+	val = axienet_ior(lp, MRMAC_RESET_OFFSET);
+	val |= (MRMAC_RX_SERDES_RST_MASK | MRMAC_TX_SERDES_RST_MASK |
+		MRMAC_RX_RST_MASK | MRMAC_TX_RST_MASK);
+	axienet_iow(lp, MRMAC_RESET_OFFSET, val);
+	mdelay(MRMAC_RESET_DELAY);
+
+	reg = axienet_ior(lp, MRMAC_MODE_OFFSET);
+	if (lp->mrmac_rate == SPEED_25000) {
+		reg &= ~MRMAC_CTL_RATE_CFG_MASK;
+		reg |= MRMAC_CTL_DATA_RATE_25G;
+		reg |= (MRMAC_CTL_AXIS_CFG_25G_IND << MRMAC_CTL_AXIS_CFG_SHIFT);
+		reg |= (MRMAC_CTL_SERDES_WIDTH_25G <<
+			MRMAC_CTL_SERDES_WIDTH_SHIFT);
+	} else {
+		reg &= ~MRMAC_CTL_RATE_CFG_MASK;
+		reg |= MRMAC_CTL_DATA_RATE_10G;
+		reg |= (MRMAC_CTL_AXIS_CFG_10G_IND << MRMAC_CTL_AXIS_CFG_SHIFT);
+		reg |= (MRMAC_CTL_SERDES_WIDTH_10G <<
+			MRMAC_CTL_SERDES_WIDTH_SHIFT);
+	}
+
+	/* For tick reg */
+	reg |= MRMAC_CTL_PM_TICK_MASK;
+	axienet_iow(lp, MRMAC_MODE_OFFSET, reg);
+
+	val = axienet_ior(lp, MRMAC_RESET_OFFSET);
+	val &= ~(MRMAC_RX_SERDES_RST_MASK | MRMAC_TX_SERDES_RST_MASK |
+		MRMAC_RX_RST_MASK | MRMAC_TX_RST_MASK);
+	axienet_iow(lp, MRMAC_RESET_OFFSET, val);
+}
+
+static inline int axienet_mrmac_gt_reset(struct net_device *ndev)
+{
+	struct axienet_local *lp = netdev_priv(ndev);
+	u32 err, val;
+	int i;
+
+	if (mrmac_pll_rst == 0) {
+		/* PLL reset for all lanes */
+
+		for (i = 0; i < MRMAC_MAX_GT_LANES; i++) {
+			iowrite32(MRMAC_GT_RST_ALL_MASK, (lp->gt_ctrl +
+				  (MRMAC_GT_LANE_OFFSET * i) +
+				  MRMAC_GT_CTRL_OFFSET));
+			mdelay(MRMAC_RESET_DELAY);
+			iowrite32(0, (lp->gt_ctrl + (MRMAC_GT_LANE_OFFSET * i) +
+				      MRMAC_GT_CTRL_OFFSET));
+		}
+
+		/* Wait for PLL lock with timeout */
+		err = readl_poll_timeout(lp->gt_pll + MRMAC_GT_PLL_STS_OFFSET,
+					 val, (val & MRMAC_GT_PLL_DONE_MASK),
+					 10, DELAY_OF_ONE_MILLISEC);
+		if (err) {
+			netdev_err(ndev, "MRMAC PLL lock not complete! Cross-check the MAC ref clock configuration\n");
+			return -ENODEV;
+		}
+		mrmac_pll_rst = 1;
+	}
+
+	if (lp->mrmac_rate == SPEED_25000)
+		iowrite32(MRMAC_GT_25G_MASK, (lp->gt_ctrl +
+			  MRMAC_GT_LANE_OFFSET * lp->gt_lane +
+			  MRMAC_GT_RATE_OFFSET));
+	else
+		iowrite32(MRMAC_GT_10G_MASK, (lp->gt_ctrl +
+			  MRMAC_GT_LANE_OFFSET * lp->gt_lane +
+			  MRMAC_GT_RATE_OFFSET));
+
+	iowrite32(MRMAC_GT_RST_RX_MASK | MRMAC_GT_RST_TX_MASK,
+		  (lp->gt_ctrl + MRMAC_GT_LANE_OFFSET * lp->gt_lane +
+		  MRMAC_GT_CTRL_OFFSET));
+	mdelay(MRMAC_RESET_DELAY);
+	iowrite32(0, (lp->gt_ctrl + MRMAC_GT_LANE_OFFSET * lp->gt_lane +
+		  MRMAC_GT_CTRL_OFFSET));
+	mdelay(MRMAC_RESET_DELAY);
+
+	return 0;
+}
+
+void __axienet_device_reset(struct axienet_dma_q *q)
+{
+	u32 timeout;
 	/* Reset Axi DMA. This would reset Axi Ethernet core as well. The reset
 	 * process of Axi DMA takes a while to complete as all pending
 	 * commands/transfers will be flushed or completed during this
@@ -434,32 +544,24 @@ static int __axienet_device_reset(struct axienet_local *lp)
 	 * Note that even though both TX and RX have their own reset register,
 	 * they both reset the entire DMA core, so only one needs to be used.
 	 */
-	axienet_dma_out32(lp, XAXIDMA_TX_CR_OFFSET, XAXIDMA_CR_RESET_MASK);
-	ret = read_poll_timeout(axienet_dma_in32, value,
-				!(value & XAXIDMA_CR_RESET_MASK),
-				DELAY_OF_ONE_MILLISEC, 50000, false, lp,
-				XAXIDMA_TX_CR_OFFSET);
-	if (ret) {
-		dev_err(lp->dev, "%s: DMA reset timeout!\n", __func__);
-		return ret;
+	axienet_dma_out32(q, XAXIDMA_TX_CR_OFFSET, XAXIDMA_CR_RESET_MASK);
+	timeout = DELAY_OF_ONE_MILLISEC;
+	while (axienet_dma_in32(q, XAXIDMA_TX_CR_OFFSET) &
+				XAXIDMA_CR_RESET_MASK) {
+		udelay(1);
+		if (--timeout == 0) {
+			netdev_err(q->lp->ndev, "%s: DMA reset timeout!\n",
+				   __func__);
+			break;
+		}
 	}
-
-	/* Wait for PhyRstCmplt bit to be set, indicating the PHY reset has finished */
-	ret = read_poll_timeout(axienet_ior, value,
-				value & XAE_INT_PHYRSTCMPLT_MASK,
-				DELAY_OF_ONE_MILLISEC, 50000, false, lp,
-				XAE_IS_OFFSET);
-	if (ret) {
-		dev_err(lp->dev, "%s: timeout waiting for PhyRstCmplt\n", __func__);
-		return ret;
-	}
-
-	return 0;
 }
 
 /**
  * axienet_device_reset - Reset and initialize the Axi Ethernet hardware.
  * @ndev:	Pointer to the net_device structure
+ *
+ * Return: 0 on success, Negative value on errors
  *
  * This function is called to reset and initialize the Axi Ethernet core. This
  * is typically called during initialization. It does a reset of the Axi DMA
@@ -467,58 +569,139 @@ static int __axienet_device_reset(struct axienet_local *lp)
  * areconnected to Axi Ethernet reset lines, this in turn resets the Axi
  * Ethernet core. No separate hardware reset is done for the Axi Ethernet
  * core.
- * Returns 0 on success or a negative error number otherwise.
  */
 static int axienet_device_reset(struct net_device *ndev)
 {
 	u32 axienet_status;
 	struct axienet_local *lp = netdev_priv(ndev);
+	u32 err, val;
+	struct axienet_dma_q *q;
+	u32 i;
 	int ret;
 
-	ret = __axienet_device_reset(lp);
-	if (ret)
-		return ret;
+	if (lp->axienet_config->mactype == XAXIENET_10G_25G) {
+		/* Reset the XXV MAC */
+		val = axienet_ior(lp, XXV_GT_RESET_OFFSET);
+		val |= XXV_GT_RESET_MASK;
+		axienet_iow(lp, XXV_GT_RESET_OFFSET, val);
+		/* Wait for 1ms for GT reset to complete as per spec */
+		mdelay(1);
+		val = axienet_ior(lp, XXV_GT_RESET_OFFSET);
+		val &= ~XXV_GT_RESET_MASK;
+		axienet_iow(lp, XXV_GT_RESET_OFFSET, val);
+	}
+
+	if (lp->axienet_config->mactype == XAXIENET_MRMAC) {
+		/* Reset MRMAC */
+		axienet_mrmac_reset(lp);
+		ret = axienet_mrmac_gt_reset(ndev);
+		if (ret < 0)
+			return ret;
+	}
+
+	if (!lp->is_tsn) {
+		for_each_rx_dma_queue(lp, i) {
+			q = lp->dq[i];
+			__axienet_device_reset(q);
+#ifndef CONFIG_AXIENET_HAS_MCDMA
+			__axienet_device_reset(q);
+#endif
+		}
+	}
 
 	lp->max_frm_size = XAE_MAX_VLAN_FRAME_SIZE;
-	lp->options |= XAE_OPTION_VLAN;
-	lp->options &= (~XAE_OPTION_JUMBO);
+	if (lp->axienet_config->mactype != XAXIENET_10G_25G &&
+	    lp->axienet_config->mactype != XAXIENET_MRMAC) {
+		lp->options |= XAE_OPTION_VLAN;
+		lp->options &= (~XAE_OPTION_JUMBO);
+	}
 
-	if ((ndev->mtu > XAE_MTU) &&
-		(ndev->mtu <= XAE_JUMBO_MTU)) {
+	if ((ndev->mtu > XAE_MTU) && (ndev->mtu <= XAE_JUMBO_MTU)) {
 		lp->max_frm_size = ndev->mtu + VLAN_ETH_HLEN +
 					XAE_TRL_SIZE;
-
-		if (lp->max_frm_size <= lp->rxmem)
+		if (lp->max_frm_size <= lp->rxmem &&
+		    (lp->axienet_config->mactype != XAXIENET_10G_25G &&
+		     lp->axienet_config->mactype != XAXIENET_MRMAC))
 			lp->options |= XAE_OPTION_JUMBO;
 	}
 
-	ret = axienet_dma_bd_init(ndev);
-	if (ret) {
-		netdev_err(ndev, "%s: descriptor allocation failed\n",
-			   __func__);
-		return ret;
+	if (!lp->is_tsn) {
+		ret = axienet_dma_bd_init(ndev);
+		if (ret < 0) {
+			netdev_err(ndev, "%s: descriptor allocation failed\n",
+				   __func__);
+			return ret;
+		}
 	}
 
-	axienet_status = axienet_ior(lp, XAE_RCW1_OFFSET);
-	axienet_status &= ~XAE_RCW1_RX_MASK;
-	axienet_iow(lp, XAE_RCW1_OFFSET, axienet_status);
+	if (lp->axienet_config->mactype != XAXIENET_10G_25G &&
+	    lp->axienet_config->mactype != XAXIENET_MRMAC) {
+		axienet_status = axienet_ior(lp, XAE_RCW1_OFFSET);
+		axienet_status &= ~XAE_RCW1_RX_MASK;
+		axienet_iow(lp, XAE_RCW1_OFFSET, axienet_status);
+	}
 
-	axienet_status = axienet_ior(lp, XAE_IP_OFFSET);
-	if (axienet_status & XAE_INT_RXRJECT_MASK)
-		axienet_iow(lp, XAE_IS_OFFSET, XAE_INT_RXRJECT_MASK);
-	axienet_iow(lp, XAE_IE_OFFSET, lp->eth_irq > 0 ?
-		    XAE_INT_RECV_ERROR_MASK : 0);
+	if (lp->axienet_config->mactype == XAXIENET_10G_25G) {
+		/* Check for block lock bit got set or not
+		 * This ensures that 10G ethernet IP
+		 * is functioning normally or not.
+		 */
+		err = readl_poll_timeout(lp->regs + XXV_STATRX_BLKLCK_OFFSET,
+					 val, (val & XXV_RX_BLKLCK_MASK),
+					 10, DELAY_OF_ONE_MILLISEC);
+		if (err) {
+			netdev_err(ndev, "XXV MAC block lock not complete! Cross-check the MAC ref clock configuration\n");
+		}
+#ifdef CONFIG_XILINX_AXI_EMAC_HWTSTAMP
+		if (!lp->is_tsn) {
+			axienet_rxts_iow(lp, XAXIFIFO_TXTS_RDFR,
+					 XAXIFIFO_TXTS_RESET_MASK);
+			axienet_rxts_iow(lp, XAXIFIFO_TXTS_SRR,
+					 XAXIFIFO_TXTS_RESET_MASK);
+			axienet_txts_iow(lp, XAXIFIFO_TXTS_RDFR,
+					 XAXIFIFO_TXTS_RESET_MASK);
+			axienet_txts_iow(lp, XAXIFIFO_TXTS_SRR,
+					 XAXIFIFO_TXTS_RESET_MASK);
+		}
+#endif
+	}
 
-	axienet_iow(lp, XAE_FCC_OFFSET, XAE_FCC_FCRX_MASK);
+#ifdef CONFIG_XILINX_AXI_EMAC_HWTSTAMP
+	if (lp->axienet_config->mactype == XAXIENET_MRMAC) {
+		axienet_rxts_iow(lp, XAXIFIFO_TXTS_RDFR,
+				 XAXIFIFO_TXTS_RESET_MASK);
+		axienet_rxts_iow(lp, XAXIFIFO_TXTS_SRR,
+				 XAXIFIFO_TXTS_RESET_MASK);
+		axienet_txts_iow(lp, XAXIFIFO_TXTS_RDFR,
+				 XAXIFIFO_TXTS_RESET_MASK);
+		axienet_txts_iow(lp, XAXIFIFO_TXTS_SRR,
+				 XAXIFIFO_TXTS_RESET_MASK);
+	}
+#endif
 
-	/* Sync default options with HW but leave receiver and
-	 * transmitter disabled.
-	 */
-	axienet_setoptions(ndev, lp->options &
-			   ~(XAE_OPTION_TXEN | XAE_OPTION_RXEN));
+	if ((lp->axienet_config->mactype == XAXIENET_1G) &&
+	    !lp->eth_hasnobuf) {
+		axienet_status = axienet_ior(lp, XAE_IP_OFFSET);
+		if (axienet_status & XAE_INT_RXRJECT_MASK)
+			axienet_iow(lp, XAE_IS_OFFSET, XAE_INT_RXRJECT_MASK);
+		/* Enable receive erros */
+		axienet_iow(lp, XAE_IE_OFFSET, lp->eth_irq > 0 ?
+			    XAE_INT_RECV_ERROR_MASK : 0);
+	}
+
+	if (lp->axienet_config->mactype == XAXIENET_10G_25G ||
+	    lp->axienet_config->mactype == XAXIENET_MRMAC) {
+		lp->options |= XAE_OPTION_FCS_STRIP;
+		lp->options |= XAE_OPTION_FCS_INSERT;
+	} else {
+		axienet_iow(lp, XAE_FCC_OFFSET, XAE_FCC_FCRX_MASK);
+	}
+	lp->axienet_config->setoptions(ndev, lp->options &
+				       ~(XAE_OPTION_TXEN | XAE_OPTION_RXEN));
+
 	axienet_set_mac_address(ndev, NULL);
 	axienet_set_multicast_list(ndev);
-	axienet_setoptions(ndev, lp->options);
+	lp->axienet_config->setoptions(ndev, lp->options);
 
 	netif_trans_update(ndev);
 
@@ -526,70 +709,314 @@ static int axienet_device_reset(struct net_device *ndev)
 }
 
 /**
- * axienet_free_tx_chain - Clean up a series of linked TX descriptors.
+ * axienet_adjust_link - Adjust the PHY link speed/duplex.
  * @ndev:	Pointer to the net_device structure
- * @first_bd:	Index of first descriptor to clean up
- * @nr_bds:	Number of descriptors to clean up, can be -1 if unknown.
- * @sizep:	Pointer to a u32 filled with the total sum of all bytes
- * 		in all cleaned-up descriptors. Ignored if NULL.
  *
- * Would either be called after a successful transmit operation, or after
- * there was an error when setting up the chain.
- * Returns the number of descriptors handled.
+ * This function is called to change the speed and duplex setting after
+ * auto negotiation is done by the PHY. This is the function that gets
+ * registered with the PHY interface through the "of_phy_connect" call.
  */
-static int axienet_free_tx_chain(struct net_device *ndev, u32 first_bd,
-				 int nr_bds, u32 *sizep)
+void axienet_adjust_link(struct net_device *ndev)
 {
+	u32 emmc_reg;
+	u32 link_state;
+	u32 setspeed = 1;
 	struct axienet_local *lp = netdev_priv(ndev);
-	struct axidma_bd *cur_p;
-	int max_bds = nr_bds;
-	unsigned int status;
-	dma_addr_t phys;
-	int i;
+	struct phy_device *phy = ndev->phydev;
 
-	if (max_bds == -1)
-		max_bds = lp->tx_bd_num;
+	link_state = phy->speed | (phy->duplex << 1) | phy->link;
+	if (lp->last_link != link_state) {
+		if ((phy->speed == SPEED_10) || (phy->speed == SPEED_100)) {
+			if (lp->phy_mode == PHY_INTERFACE_MODE_1000BASEX)
+				setspeed = 0;
+		} else {
+			if ((phy->speed == SPEED_1000) &&
+			    (lp->phy_mode == PHY_INTERFACE_MODE_MII))
+				setspeed = 0;
+		}
 
-	for (i = 0; i < max_bds; i++) {
-		cur_p = &lp->tx_bd_v[(first_bd + i) % lp->tx_bd_num];
-		status = cur_p->status;
+		if (setspeed == 1) {
+			emmc_reg = axienet_ior(lp, XAE_EMMC_OFFSET);
+			emmc_reg &= ~XAE_EMMC_LINKSPEED_MASK;
 
-		/* If no number is given, clean up *all* descriptors that have
-		 * been completed by the MAC.
+			switch (phy->speed) {
+			case SPEED_2500:
+				emmc_reg |= XAE_EMMC_LINKSPD_2500;
+				break;
+			case SPEED_1000:
+				emmc_reg |= XAE_EMMC_LINKSPD_1000;
+				break;
+			case SPEED_100:
+				emmc_reg |= XAE_EMMC_LINKSPD_100;
+				break;
+			case SPEED_10:
+				emmc_reg |= XAE_EMMC_LINKSPD_10;
+				break;
+			default:
+				dev_err(&ndev->dev, "Speed other than 10, 100 ");
+				dev_err(&ndev->dev, "or 1Gbps is not supported\n");
+				break;
+			}
+
+			axienet_iow(lp, XAE_EMMC_OFFSET, emmc_reg);
+			phy_print_status(phy);
+		} else {
+			netdev_err(ndev,
+				   "Error setting Axi Ethernet mac speed\n");
+		}
+
+		lp->last_link = link_state;
+	}
+}
+
+#ifdef CONFIG_XILINX_AXI_EMAC_HWTSTAMP
+/**
+ * axienet_tx_hwtstamp - Read tx timestamp from hw and update it to the skbuff
+ * @lp:		Pointer to axienet local structure
+ * @cur_p:	Pointer to the axi_dma/axi_mcdma current bd
+ *
+ * Return:	None.
+ */
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+void axienet_tx_hwtstamp(struct axienet_local *lp,
+			 struct aximcdma_bd *cur_p)
+#else
+void axienet_tx_hwtstamp(struct axienet_local *lp,
+			 struct axidma_bd *cur_p)
+#endif
+{
+	u32 sec = 0, nsec = 0, val;
+	u64 time64;
+	int err = 0;
+	u32 count, len = lp->axienet_config->tx_ptplen;
+	struct skb_shared_hwtstamps *shhwtstamps =
+		skb_hwtstamps((struct sk_buff *)cur_p->ptp_tx_skb);
+
+	val = axienet_txts_ior(lp, XAXIFIFO_TXTS_ISR);
+	if (unlikely(!(val & XAXIFIFO_TXTS_INT_RC_MASK)))
+		dev_info(lp->dev, "Did't get FIFO tx interrupt %d\n", val);
+
+	/* If FIFO is configured in cut through Mode we will get Rx complete
+	 * interrupt even one byte is there in the fifo wait for the full packet
+	 */
+	err = readl_poll_timeout_atomic(lp->tx_ts_regs + XAXIFIFO_TXTS_RLR, val,
+					((val & XAXIFIFO_TXTS_RXFD_MASK) >=
+					len), 0, 1000000);
+	if (err) {
+		netdev_err(lp->ndev, "%s: Didn't get the full timestamp packet",
+			   __func__);
+		goto skb_exit;
+	}
+
+	nsec = axienet_txts_ior(lp, XAXIFIFO_TXTS_RXFD);
+	sec  = axienet_txts_ior(lp, XAXIFIFO_TXTS_RXFD);
+	val = axienet_txts_ior(lp, XAXIFIFO_TXTS_RXFD);
+	val = ((val & XAXIFIFO_TXTS_TAG_MASK) >> XAXIFIFO_TXTS_TAG_SHIFT);
+	dev_dbg(lp->dev, "tx_stamp:[%04x] %04x %u %9u\n",
+		cur_p->ptp_tx_ts_tag, val, sec, nsec);
+
+	if (val != cur_p->ptp_tx_ts_tag) {
+		count = axienet_txts_ior(lp, XAXIFIFO_TXTS_RFO);
+		while (count) {
+			nsec = axienet_txts_ior(lp, XAXIFIFO_TXTS_RXFD);
+			sec  = axienet_txts_ior(lp, XAXIFIFO_TXTS_RXFD);
+			val = axienet_txts_ior(lp, XAXIFIFO_TXTS_RXFD);
+			val = ((val & XAXIFIFO_TXTS_TAG_MASK) >>
+				XAXIFIFO_TXTS_TAG_SHIFT);
+
+			dev_dbg(lp->dev, "tx_stamp:[%04x] %04x %u %9u\n",
+				cur_p->ptp_tx_ts_tag, val, sec, nsec);
+			if (val == cur_p->ptp_tx_ts_tag)
+				break;
+			count = axienet_txts_ior(lp, XAXIFIFO_TXTS_RFO);
+		}
+		if (val != cur_p->ptp_tx_ts_tag) {
+			dev_info(lp->dev, "Mismatching 2-step tag. Got %x",
+				 val);
+			dev_info(lp->dev, "Expected %x\n",
+				 cur_p->ptp_tx_ts_tag);
+		}
+	}
+
+	if (lp->axienet_config->mactype != XAXIENET_10G_25G &&
+	    lp->axienet_config->mactype != XAXIENET_MRMAC)
+		val = axienet_txts_ior(lp, XAXIFIFO_TXTS_RXFD);
+
+skb_exit:
+	time64 = sec * NS_PER_SEC + nsec;
+	memset(shhwtstamps, 0, sizeof(struct skb_shared_hwtstamps));
+	shhwtstamps->hwtstamp = ns_to_ktime(time64);
+	if (lp->axienet_config->mactype != XAXIENET_10G_25G &&
+	    lp->axienet_config->mactype != XAXIENET_MRMAC)
+		skb_pull((struct sk_buff *)cur_p->ptp_tx_skb,
+			 AXIENET_TS_HEADER_LEN);
+
+	skb_tstamp_tx((struct sk_buff *)cur_p->ptp_tx_skb, shhwtstamps);
+	dev_kfree_skb_any((struct sk_buff *)cur_p->ptp_tx_skb);
+	cur_p->ptp_tx_skb = 0;
+}
+
+static inline bool is_ptp_os_pdelay_req(struct sk_buff *skb,
+					struct axienet_local *lp)
+{
+	u8 *msg_type;
+
+	msg_type = (u8 *)skb->data + PTP_TYPE_OFFSET;
+	return (((*msg_type & 0xF) == PTP_TYPE_PDELAY_REQ) &&
+		(lp->tstamp_config.tx_type == HWTSTAMP_TX_ONESTEP_P2P));
+}
+
+/**
+ * axienet_rx_hwtstamp - Read rx timestamp from hw and update it to the skbuff
+ * @lp:		Pointer to axienet local structure
+ * @skb:	Pointer to the sk_buff structure
+ *
+ * Return:	None.
+ */
+static void axienet_rx_hwtstamp(struct axienet_local *lp,
+				struct sk_buff *skb)
+{
+	u32 sec = 0, nsec = 0, val;
+	u64 time64;
+	int err = 0;
+	struct skb_shared_hwtstamps *shhwtstamps = skb_hwtstamps(skb);
+
+	val = axienet_rxts_ior(lp, XAXIFIFO_TXTS_ISR);
+	if (unlikely(!(val & XAXIFIFO_TXTS_INT_RC_MASK))) {
+		dev_info(lp->dev, "Did't get FIFO rx interrupt %d\n", val);
+		return;
+	}
+
+	val = axienet_rxts_ior(lp, XAXIFIFO_TXTS_RFO);
+	if (!val)
+		return;
+
+	/* If FIFO is configured in cut through Mode we will get Rx complete
+	 * interrupt even one byte is there in the fifo wait for the full packet
+	 */
+	err = readl_poll_timeout_atomic(lp->rx_ts_regs + XAXIFIFO_TXTS_RLR, val,
+					((val & XAXIFIFO_TXTS_RXFD_MASK) >= 12),
+					0, 1000000);
+	if (err) {
+		netdev_err(lp->ndev, "%s: Didn't get the full timestamp packet",
+			   __func__);
+		return;
+	}
+
+	nsec = axienet_rxts_ior(lp, XAXIFIFO_TXTS_RXFD);
+	sec  = axienet_rxts_ior(lp, XAXIFIFO_TXTS_RXFD);
+	val = axienet_rxts_ior(lp, XAXIFIFO_TXTS_RXFD);
+
+	if (is_ptp_os_pdelay_req(skb, lp)) {
+		/* Need to save PDelay resp RX time for HW 1 step
+		 * timestamping on PDelay Response.
 		 */
-		if (nr_bds == -1 && !(status & XAXIDMA_BD_STS_COMPLETE_MASK))
-			break;
+		lp->ptp_os_cf = mul_u32_u32(sec, NSEC_PER_SEC);
+		lp->ptp_os_cf += nsec;
+		lp->ptp_os_cf = (lp->ptp_os_cf << 16);
+	}
 
-		/* Ensure we see complete descriptor update */
-		dma_rmb();
-		phys = desc_get_phys_addr(lp, cur_p);
-		dma_unmap_single(ndev->dev.parent, phys,
-				 (cur_p->cntrl & XAXIDMA_BD_CTRL_LENGTH_MASK),
-				 DMA_TO_DEVICE);
+	if (lp->tstamp_config.rx_filter == HWTSTAMP_FILTER_ALL) {
+		time64 = sec * NS_PER_SEC + nsec;
+		shhwtstamps->hwtstamp = ns_to_ktime(time64);
+	}
+}
+#endif
 
-		if (cur_p->skb && (status & XAXIDMA_BD_STS_COMPLETE_MASK))
-			dev_consume_skb_irq(cur_p->skb);
+/**
+ * axienet_start_xmit_done - Invoked once a transmit is completed by the
+ * Axi DMA Tx channel.
+ * @ndev:	Pointer to the net_device structure
+ * @q:		Pointer to DMA queue structure
+ *
+ * This function is invoked from the Axi DMA Tx isr to notify the completion
+ * of transmit operation. It clears fields in the corresponding Tx BDs and
+ * unmaps the corresponding buffer so that CPU can regain ownership of the
+ * buffer. It finally invokes "netif_wake_queue" to restart transmission if
+ * required.
+ */
+void axienet_start_xmit_done(struct net_device *ndev,
+			     struct axienet_dma_q *q)
+{
+	u32 size = 0;
+	u32 packets = 0;
+	struct axienet_local *lp = netdev_priv(ndev);
 
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	struct aximcdma_bd *cur_p;
+#else
+	struct axidma_bd *cur_p;
+#endif
+	unsigned int status = 0;
+
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	cur_p = &q->txq_bd_v[q->tx_bd_ci];
+	status = cur_p->sband_stats;
+#else
+	cur_p = &q->tx_bd_v[q->tx_bd_ci];
+	status = cur_p->status;
+#endif
+	while (status & XAXIDMA_BD_STS_COMPLETE_MASK) {
+#ifdef CONFIG_XILINX_AXI_EMAC_HWTSTAMP
+		if (cur_p->ptp_tx_skb)
+			axienet_tx_hwtstamp(lp, cur_p);
+#endif
+		if (cur_p->tx_desc_mapping == DESC_DMA_MAP_PAGE)
+			dma_unmap_page(ndev->dev.parent, cur_p->phys,
+				       cur_p->cntrl &
+				       XAXIDMA_BD_CTRL_LENGTH_MASK,
+				       DMA_TO_DEVICE);
+		else
+			dma_unmap_single(ndev->dev.parent, cur_p->phys,
+					 cur_p->cntrl &
+					 XAXIDMA_BD_CTRL_LENGTH_MASK,
+					 DMA_TO_DEVICE);
+		if (cur_p->tx_skb)
+			dev_kfree_skb_irq((struct sk_buff *)cur_p->tx_skb);
+		/*cur_p->phys = 0;*/
 		cur_p->app0 = 0;
 		cur_p->app1 = 0;
 		cur_p->app2 = 0;
 		cur_p->app4 = 0;
-		cur_p->skb = NULL;
-		/* ensure our transmit path and device don't prematurely see status cleared */
-		wmb();
-		cur_p->cntrl = 0;
 		cur_p->status = 0;
+		cur_p->tx_skb = 0;
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+		cur_p->sband_stats = 0;
+#endif
 
-		if (sizep)
-			*sizep += status & XAXIDMA_BD_STS_ACTUAL_LEN_MASK;
+		size += status & XAXIDMA_BD_STS_ACTUAL_LEN_MASK;
+		packets++;
+
+		if (++q->tx_bd_ci >= lp->tx_bd_num)
+			q->tx_bd_ci = 0;
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+		cur_p = &q->txq_bd_v[q->tx_bd_ci];
+		status = cur_p->sband_stats;
+#else
+		cur_p = &q->tx_bd_v[q->tx_bd_ci];
+		status = cur_p->status;
+#endif
 	}
 
-	return i;
+	ndev->stats.tx_packets += packets;
+	ndev->stats.tx_bytes += size;
+	q->tx_packets += packets;
+	q->tx_bytes += size;
+
+	/* Matches barrier in axienet_start_xmit */
+	smp_mb();
+
+	/* Fixme: With the existing multiqueue implementation
+	 * in the driver it is difficult to get the exact queue info.
+	 * We should wake only the particular queue
+	 * instead of waking all ndev queues.
+	 */
+	netif_tx_wake_all_queues(ndev);
 }
 
 /**
  * axienet_check_tx_bd_space - Checks if a BD/group of BDs are currently busy
- * @lp:		Pointer to the axienet_local structure
+ * @q:		Pointer to DMA queue structure
  * @num_frag:	The number of BDs to check for
  *
  * Return: 0, on success
@@ -600,50 +1027,417 @@ static int axienet_free_tx_chain(struct net_device *ndev, u32 first_bd,
  * transmission. If the BD or any of the BDs are not free the function
  * returns a busy status. This is invoked from axienet_start_xmit.
  */
-static inline int axienet_check_tx_bd_space(struct axienet_local *lp,
+static inline int axienet_check_tx_bd_space(struct axienet_dma_q *q,
 					    int num_frag)
 {
+	struct axienet_local *lp = q->lp;
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	struct aximcdma_bd *cur_p;
+
+	if (CIRC_SPACE(q->tx_bd_tail, q->tx_bd_ci, lp->tx_bd_num) < (num_frag + 1))
+		return NETDEV_TX_BUSY;
+
+	cur_p = &q->txq_bd_v[(q->tx_bd_tail + num_frag) % lp->tx_bd_num];
+	if (cur_p->sband_stats & XMCDMA_BD_STS_ALL_MASK)
+		return NETDEV_TX_BUSY;
+#else
 	struct axidma_bd *cur_p;
 
-	/* Ensure we see all descriptor updates from device or TX IRQ path */
-	rmb();
-	cur_p = &lp->tx_bd_v[(lp->tx_bd_tail + num_frag) % lp->tx_bd_num];
-	if (cur_p->cntrl)
+	if (CIRC_SPACE(q->tx_bd_tail, q->tx_bd_ci, lp->tx_bd_num) < (num_frag + 1))
 		return NETDEV_TX_BUSY;
+
+	cur_p = &q->tx_bd_v[(q->tx_bd_tail + num_frag) % lp->tx_bd_num];
+	if (cur_p->status & XAXIDMA_BD_STS_ALL_MASK)
+		return NETDEV_TX_BUSY;
+#endif
 	return 0;
 }
 
+#ifdef CONFIG_XILINX_AXI_EMAC_HWTSTAMP
 /**
- * axienet_start_xmit_done - Invoked once a transmit is completed by the
- * Axi DMA Tx channel.
- * @ndev:	Pointer to the net_device structure
+ * axienet_create_tsheader - Create timestamp header for tx
+ * @q:		Pointer to DMA queue structure
+ * @buf:	Pointer to the buf to copy timestamp header
+ * @msg_type:	PTP message type
  *
- * This function is invoked from the Axi DMA Tx isr to notify the completion
- * of transmit operation. It clears fields in the corresponding Tx BDs and
- * unmaps the corresponding buffer so that CPU can regain ownership of the
- * buffer. It finally invokes "netif_wake_queue" to restart transmission if
- * required.
+ * Return: 0, on success
+ *	    NETDEV_TX_BUSY, if timestamp FIFO has no vacancy
  */
-static void axienet_start_xmit_done(struct net_device *ndev)
+static int axienet_create_tsheader(u8 *buf, u8 msg_type,
+				   struct axienet_dma_q *q)
 {
+	struct axienet_local *lp = q->lp;
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	struct aximcdma_bd *cur_p;
+#else
+	struct axidma_bd *cur_p;
+#endif
+	u64 val;
+	u32 tmp[MRMAC_TS_HEADER_WORDS];
+	unsigned long flags;
+	int i;
+
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	cur_p = &q->txq_bd_v[q->tx_bd_tail];
+#else
+	cur_p = &q->tx_bd_v[q->tx_bd_tail];
+#endif
+
+	if ((msg_type & 0xF) == TX_TS_OP_NOOP) {
+		buf[0] = TX_TS_OP_NOOP;
+	} else if ((msg_type & 0xF) == TX_TS_OP_ONESTEP) {
+		if (lp->axienet_config->mactype == XAXIENET_MRMAC) {
+			/* For Sync Packet */
+			if ((msg_type & 0xF0) == MSG_TYPE_SYNC_FLAG) {
+				buf[0] = TX_TS_OP_ONESTEP | TX_TS_CSUM_UPDATE_MRMAC;
+				buf[2] = cur_p->ptp_tx_ts_tag & 0xFF;
+				buf[3] = (cur_p->ptp_tx_ts_tag >> 8) & 0xFF;
+				buf[4] = TX_PTP_CF_OFFSET;
+				buf[6] = TX_PTP_CSUM_OFFSET;
+			}
+			/* For PDelay Response packet */
+			if ((msg_type & 0xF0) == MSG_TYPE_PDELAY_RESP_FLAG) {
+				buf[0] = TX_TS_OP_ONESTEP | TX_TS_CSUM_UPDATE_MRMAC |
+					TX_TS_PDELAY_UPDATE_MRMAC;
+				buf[2] = cur_p->ptp_tx_ts_tag & 0xFF;
+				buf[3] = (cur_p->ptp_tx_ts_tag >> 8) & 0xFF;
+				buf[4] = TX_PTP_CF_OFFSET;
+				buf[6] = TX_PTP_CSUM_OFFSET;
+				/* Prev saved TS */
+				memcpy(&buf[8], &lp->ptp_os_cf, 8);
+			}
+		} else {
+			/* Legacy */
+			buf[0] = TX_TS_OP_ONESTEP;
+			buf[1] = TX_TS_CSUM_UPDATE;
+			buf[4] = TX_PTP_TS_OFFSET;
+			buf[6] = TX_PTP_CSUM_OFFSET;
+		}
+	} else {
+		buf[0] = TX_TS_OP_TWOSTEP;
+		buf[2] = cur_p->ptp_tx_ts_tag & 0xFF;
+		buf[3] = (cur_p->ptp_tx_ts_tag >> 8) & 0xFF;
+	}
+
+	if (lp->axienet_config->mactype == XAXIENET_1G ||
+	    lp->axienet_config->mactype == XAXIENET_2_5G) {
+		memcpy(&val, buf, AXIENET_TS_HEADER_LEN);
+		swab64s(&val);
+		memcpy(buf, &val, AXIENET_TS_HEADER_LEN);
+	} else if (lp->axienet_config->mactype == XAXIENET_10G_25G ||
+		   lp->axienet_config->mactype == XAXIENET_MRMAC) {
+		memcpy(&tmp[0], buf, lp->axienet_config->ts_header_len);
+		/* Check for Transmit Data FIFO Vacancy */
+		spin_lock_irqsave(&lp->ptp_tx_lock, flags);
+		if (!axienet_txts_ior(lp, XAXIFIFO_TXTS_TDFV)) {
+			spin_unlock_irqrestore(&lp->ptp_tx_lock, flags);
+			return NETDEV_TX_BUSY;
+		}
+
+		for (i = 0; i < lp->axienet_config->ts_header_len / 4; i++)
+			axienet_txts_iow(lp, XAXIFIFO_TXTS_TXFD, tmp[i]);
+
+		axienet_txts_iow(lp, XAXIFIFO_TXTS_TLR, lp->axienet_config->ts_header_len);
+		spin_unlock_irqrestore(&lp->ptp_tx_lock, flags);
+	}
+
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_XILINX_AXI_EMAC_HWTSTAMP
+static inline u8 ptp_os(struct sk_buff *skb, struct axienet_local *lp)
+{
+	u8 *msg_type;
+	int packet_flags = 0;
+
+	/* Identify and return packets requiring PTP one step TS */
+	msg_type = (u8 *)skb->data + PTP_TYPE_OFFSET;
+	if ((*msg_type & 0xF) == PTP_TYPE_SYNC)
+		packet_flags = MSG_TYPE_SYNC_FLAG;
+	else if (((*msg_type & 0xF) == PTP_TYPE_PDELAY_RESP) &&
+		 (lp->tstamp_config.tx_type == HWTSTAMP_TX_ONESTEP_P2P))
+		packet_flags = MSG_TYPE_PDELAY_RESP_FLAG;
+
+	return packet_flags;
+}
+
+static int axienet_skb_tstsmp(struct sk_buff **__skb, struct axienet_dma_q *q,
+			      struct net_device *ndev)
+{
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	struct aximcdma_bd *cur_p;
+#else
+	struct axidma_bd *cur_p;
+#endif
 	struct axienet_local *lp = netdev_priv(ndev);
-	u32 packets = 0;
-	u32 size = 0;
+	struct sk_buff *old_skb = *__skb;
+	struct sk_buff *skb = *__skb;
 
-	packets = axienet_free_tx_chain(ndev, lp->tx_bd_ci, -1, &size);
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	cur_p = &q->txq_bd_v[q->tx_bd_tail];
+#else
+	cur_p = &q->tx_bd_v[q->tx_bd_tail];
+#endif
 
-	lp->tx_bd_ci += packets;
-	if (lp->tx_bd_ci >= lp->tx_bd_num)
-		lp->tx_bd_ci -= lp->tx_bd_num;
+	if ((((lp->tstamp_config.tx_type == HWTSTAMP_TX_ONESTEP_SYNC) ||
+	      (lp->tstamp_config.tx_type == HWTSTAMP_TX_ON)) ||
+	       lp->eth_hasptp) && (lp->axienet_config->mactype !=
+	       XAXIENET_10G_25G) &&
+	       (lp->axienet_config->mactype != XAXIENET_MRMAC)) {
+		u8 *tmp;
+		struct sk_buff *new_skb;
 
-	ndev->stats.tx_packets += packets;
-	ndev->stats.tx_bytes += size;
+		if (skb_headroom(old_skb) < AXIENET_TS_HEADER_LEN) {
+			new_skb =
+			skb_realloc_headroom(old_skb,
+					     AXIENET_TS_HEADER_LEN);
+			if (!new_skb) {
+				dev_err(&ndev->dev, "failed to allocate new socket buffer\n");
+				dev_kfree_skb_any(old_skb);
+				return NETDEV_TX_BUSY;
+			}
 
-	/* Matches barrier in axienet_start_xmit */
-	smp_mb();
+			/*  Transfer the ownership to the
+			 *  new socket buffer if required
+			 */
+			if (old_skb->sk)
+				skb_set_owner_w(new_skb, old_skb->sk);
+			dev_kfree_skb_any(old_skb);
+			*__skb = new_skb;
+			skb = new_skb;
+		}
 
-	if (!axienet_check_tx_bd_space(lp, MAX_SKB_FRAGS + 1))
+		tmp = skb_push(skb, AXIENET_TS_HEADER_LEN);
+		memset(tmp, 0, AXIENET_TS_HEADER_LEN);
+		cur_p->ptp_tx_ts_tag++;
+
+		if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) {
+			if (lp->tstamp_config.tx_type ==
+				HWTSTAMP_TX_ONESTEP_SYNC) {
+				axienet_create_tsheader(tmp,
+							TX_TS_OP_ONESTEP
+							, q);
+			} else {
+				axienet_create_tsheader(tmp,
+							TX_TS_OP_TWOSTEP
+							, q);
+				skb_shinfo(skb)->tx_flags
+						|= SKBTX_IN_PROGRESS;
+				cur_p->ptp_tx_skb =
+					(unsigned long)skb_get(skb);
+			}
+		}
+	} else if ((skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) &&
+		   (lp->axienet_config->mactype == XAXIENET_10G_25G ||
+		   lp->axienet_config->mactype == XAXIENET_MRMAC)) {
+			cur_p->ptp_tx_ts_tag = prandom_u32_max(XAXIFIFO_TXTS_TAG_MAX) + 1;
+			dev_dbg(lp->dev, "tx_tag:[%04x]\n",
+				cur_p->ptp_tx_ts_tag);
+			if (lp->tstamp_config.tx_type == HWTSTAMP_TX_ONESTEP_SYNC ||
+			    lp->tstamp_config.tx_type == HWTSTAMP_TX_ONESTEP_P2P) {
+				u8 packet_flags = ptp_os(skb, lp);
+
+				/* Pass one step flag with packet type (sync/pdelay resp)
+				 * to command FIFO helper only when one step TS is required.
+				 * Pass the default two step flag for other PTP events.
+				 */
+				if (!packet_flags)
+					packet_flags = TX_TS_OP_TWOSTEP;
+				else
+					packet_flags |= TX_TS_OP_ONESTEP;
+
+				if (axienet_create_tsheader(lp->tx_ptpheader,
+							    packet_flags,
+							    q))
+					return NETDEV_TX_BUSY;
+
+				/* skb TS passing is required for non one step TS packets */
+				if (packet_flags == TX_TS_OP_TWOSTEP) {
+					skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
+					cur_p->ptp_tx_skb = (phys_addr_t)skb_get(skb);
+				}
+			} else {
+				if (axienet_create_tsheader(lp->tx_ptpheader,
+							    TX_TS_OP_TWOSTEP,
+							    q))
+					return NETDEV_TX_BUSY;
+				skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
+				cur_p->ptp_tx_skb = (phys_addr_t)skb_get(skb);
+			}
+	} else if (lp->axienet_config->mactype == XAXIENET_10G_25G ||
+		   lp->axienet_config->mactype == XAXIENET_MRMAC) {
+			dev_dbg(lp->dev, "tx_tag:NOOP\n");
+			if (axienet_create_tsheader(lp->tx_ptpheader,
+						    TX_TS_OP_NOOP, q))
+				return NETDEV_TX_BUSY;
+	}
+
+	return NETDEV_TX_OK;
+}
+#endif
+
+int axienet_queue_xmit(struct sk_buff *skb,
+		       struct net_device *ndev, u16 map)
+{
+	u32 ii;
+	u32 num_frag;
+	u32 csum_start_off;
+	u32 csum_index_off;
+	dma_addr_t tail_p;
+	struct axienet_local *lp = netdev_priv(ndev);
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	struct aximcdma_bd *cur_p;
+#else
+	struct axidma_bd *cur_p;
+#endif
+	unsigned long flags;
+	struct axienet_dma_q *q;
+
+	if (lp->axienet_config->mactype == XAXIENET_10G_25G ||
+	    lp->axienet_config->mactype == XAXIENET_MRMAC) {
+		/* Need to manually pad the small frames in case of XXV MAC
+		 * because the pad field is not added by the IP. We must present
+		 * a packet that meets the minimum length to the IP core.
+		 * When the IP core is configured to calculate and add the FCS
+		 * to the packet the minimum packet length is 60 bytes.
+		 */
+		if (eth_skb_pad(skb)) {
+			ndev->stats.tx_dropped++;
+			ndev->stats.tx_errors++;
+			return NETDEV_TX_OK;
+		}
+	}
+
+	num_frag = skb_shinfo(skb)->nr_frags;
+
+	q = lp->dq[map];
+
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	cur_p = &q->txq_bd_v[q->tx_bd_tail];
+#else
+	cur_p = &q->tx_bd_v[q->tx_bd_tail];
+#endif
+
+	spin_lock_irqsave(&q->tx_lock, flags);
+	if (axienet_check_tx_bd_space(q, num_frag)) {
+		if (netif_queue_stopped(ndev)) {
+			spin_unlock_irqrestore(&q->tx_lock, flags);
+			return NETDEV_TX_BUSY;
+		}
+
+		netif_stop_queue(ndev);
+
+		/* Matches barrier in axienet_start_xmit_done */
+		smp_mb();
+
+		/* Space might have just been freed - check again */
+		if (axienet_check_tx_bd_space(q, num_frag)) {
+			spin_unlock_irqrestore(&q->tx_lock, flags);
+			return NETDEV_TX_BUSY;
+		}
+
 		netif_wake_queue(ndev);
+	}
+
+#ifdef CONFIG_XILINX_AXI_EMAC_HWTSTAMP
+	if (axienet_skb_tstsmp(&skb, q, ndev)) {
+		spin_unlock_irqrestore(&q->tx_lock, flags);
+		return NETDEV_TX_BUSY;
+	}
+#endif
+
+	if (skb->ip_summed == CHECKSUM_PARTIAL && !lp->eth_hasnobuf &&
+	    (lp->axienet_config->mactype == XAXIENET_1G)) {
+		if (lp->features & XAE_FEATURE_FULL_TX_CSUM) {
+			/* Tx Full Checksum Offload Enabled */
+			cur_p->app0 |= 2;
+		} else if (lp->features & XAE_FEATURE_PARTIAL_RX_CSUM) {
+			csum_start_off = skb_transport_offset(skb);
+			csum_index_off = csum_start_off + skb->csum_offset;
+			/* Tx Partial Checksum Offload Enabled */
+			cur_p->app0 |= 1;
+			cur_p->app1 = (csum_start_off << 16) | csum_index_off;
+		}
+	} else if (skb->ip_summed == CHECKSUM_UNNECESSARY &&
+		   !lp->eth_hasnobuf &&
+		   (lp->axienet_config->mactype == XAXIENET_1G)) {
+		cur_p->app0 |= 2; /* Tx Full Checksum Offload Enabled */
+	}
+
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	cur_p->cntrl = (skb_headlen(skb) | XMCDMA_BD_CTRL_TXSOF_MASK);
+#else
+	cur_p->cntrl = (skb_headlen(skb) | XAXIDMA_BD_CTRL_TXSOF_MASK);
+#endif
+
+	if (!q->eth_hasdre &&
+	    (((phys_addr_t)skb->data & 0x3) || num_frag > 0)) {
+		skb_copy_and_csum_dev(skb, q->tx_buf[q->tx_bd_tail]);
+
+		cur_p->phys = q->tx_bufs_dma +
+			      (q->tx_buf[q->tx_bd_tail] - q->tx_bufs);
+
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+		cur_p->cntrl = skb_pagelen(skb) | XMCDMA_BD_CTRL_TXSOF_MASK;
+#else
+		cur_p->cntrl = skb_pagelen(skb) | XAXIDMA_BD_CTRL_TXSOF_MASK;
+#endif
+		goto out;
+	} else {
+		cur_p->phys = dma_map_single(ndev->dev.parent, skb->data,
+					     skb_headlen(skb), DMA_TO_DEVICE);
+	}
+	cur_p->tx_desc_mapping = DESC_DMA_MAP_SINGLE;
+
+	for (ii = 0; ii < num_frag; ii++) {
+		u32 len;
+		skb_frag_t *frag;
+
+		if (++q->tx_bd_tail >= lp->tx_bd_num)
+			q->tx_bd_tail = 0;
+
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+		cur_p = &q->txq_bd_v[q->tx_bd_tail];
+#else
+		cur_p = &q->tx_bd_v[q->tx_bd_tail];
+#endif
+		frag = &skb_shinfo(skb)->frags[ii];
+		len = skb_frag_size(frag);
+		cur_p->phys = skb_frag_dma_map(ndev->dev.parent, frag, 0, len,
+					       DMA_TO_DEVICE);
+		cur_p->cntrl = len;
+		cur_p->tx_desc_mapping = DESC_DMA_MAP_PAGE;
+	}
+
+out:
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	cur_p->cntrl |= XMCDMA_BD_CTRL_TXEOF_MASK;
+	tail_p = q->tx_bd_p + sizeof(*q->txq_bd_v) * q->tx_bd_tail;
+#else
+	cur_p->cntrl |= XAXIDMA_BD_CTRL_TXEOF_MASK;
+	tail_p = q->tx_bd_p + sizeof(*q->tx_bd_v) * q->tx_bd_tail;
+#endif
+	cur_p->tx_skb = (phys_addr_t)skb;
+	cur_p->tx_skb = (phys_addr_t)skb;
+
+	tail_p = q->tx_bd_p + sizeof(*q->tx_bd_v) * q->tx_bd_tail;
+	/* Ensure BD write before starting transfer */
+	wmb();
+
+	/* Start the transfer */
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	axienet_dma_bdout(q, XMCDMA_CHAN_TAILDESC_OFFSET(q->chan_id),
+			  tail_p);
+#else
+	axienet_dma_bdout(q, XAXIDMA_TX_TDESC_OFFSET, tail_p);
+#endif
+	if (++q->tx_bd_tail >= lp->tx_bd_num)
+		q->tx_bd_tail = 0;
+
+	spin_unlock_irqrestore(&q->tx_lock, flags);
+
+	return NETDEV_TX_OK;
 }
 
 /**
@@ -659,116 +1453,27 @@ static void axienet_start_xmit_done(struct net_device *ndev)
  * start the transmission. Additionally if checksum offloading is supported,
  * it populates AXI Stream Control fields with appropriate values.
  */
-static netdev_tx_t
-axienet_start_xmit(struct sk_buff *skb, struct net_device *ndev)
+static int axienet_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
-	u32 ii;
-	u32 num_frag;
-	u32 csum_start_off;
-	u32 csum_index_off;
-	skb_frag_t *frag;
-	dma_addr_t tail_p, phys;
-	struct axienet_local *lp = netdev_priv(ndev);
-	struct axidma_bd *cur_p;
-	u32 orig_tail_ptr = lp->tx_bd_tail;
+	u16 map = skb_get_queue_mapping(skb); /* Single dma queue default*/
 
-	num_frag = skb_shinfo(skb)->nr_frags;
-	cur_p = &lp->tx_bd_v[lp->tx_bd_tail];
-
-	if (axienet_check_tx_bd_space(lp, num_frag + 1)) {
-		/* Should not happen as last start_xmit call should have
-		 * checked for sufficient space and queue should only be
-		 * woken when sufficient space is available.
-		 */
-		netif_stop_queue(ndev);
-		if (net_ratelimit())
-			netdev_warn(ndev, "TX ring unexpectedly full\n");
-		return NETDEV_TX_BUSY;
-	}
-
-	if (skb->ip_summed == CHECKSUM_PARTIAL) {
-		if (lp->features & XAE_FEATURE_FULL_TX_CSUM) {
-			/* Tx Full Checksum Offload Enabled */
-			cur_p->app0 |= 2;
-		} else if (lp->features & XAE_FEATURE_PARTIAL_RX_CSUM) {
-			csum_start_off = skb_transport_offset(skb);
-			csum_index_off = csum_start_off + skb->csum_offset;
-			/* Tx Partial Checksum Offload Enabled */
-			cur_p->app0 |= 1;
-			cur_p->app1 = (csum_start_off << 16) | csum_index_off;
-		}
-	} else if (skb->ip_summed == CHECKSUM_UNNECESSARY) {
-		cur_p->app0 |= 2; /* Tx Full Checksum Offload Enabled */
-	}
-
-	phys = dma_map_single(ndev->dev.parent, skb->data,
-			      skb_headlen(skb), DMA_TO_DEVICE);
-	if (unlikely(dma_mapping_error(ndev->dev.parent, phys))) {
-		if (net_ratelimit())
-			netdev_err(ndev, "TX DMA mapping error\n");
-		ndev->stats.tx_dropped++;
-		return NETDEV_TX_OK;
-	}
-	desc_set_phys_addr(lp, phys, cur_p);
-	cur_p->cntrl = skb_headlen(skb) | XAXIDMA_BD_CTRL_TXSOF_MASK;
-
-	for (ii = 0; ii < num_frag; ii++) {
-		if (++lp->tx_bd_tail >= lp->tx_bd_num)
-			lp->tx_bd_tail = 0;
-		cur_p = &lp->tx_bd_v[lp->tx_bd_tail];
-		frag = &skb_shinfo(skb)->frags[ii];
-		phys = dma_map_single(ndev->dev.parent,
-				      skb_frag_address(frag),
-				      skb_frag_size(frag),
-				      DMA_TO_DEVICE);
-		if (unlikely(dma_mapping_error(ndev->dev.parent, phys))) {
-			if (net_ratelimit())
-				netdev_err(ndev, "TX DMA mapping error\n");
-			ndev->stats.tx_dropped++;
-			axienet_free_tx_chain(ndev, orig_tail_ptr, ii + 1,
-					      NULL);
-			lp->tx_bd_tail = orig_tail_ptr;
-
-			return NETDEV_TX_OK;
-		}
-		desc_set_phys_addr(lp, phys, cur_p);
-		cur_p->cntrl = skb_frag_size(frag);
-	}
-
-	cur_p->cntrl |= XAXIDMA_BD_CTRL_TXEOF_MASK;
-	cur_p->skb = skb;
-
-	tail_p = lp->tx_bd_p + sizeof(*lp->tx_bd_v) * lp->tx_bd_tail;
-	/* Start the transfer */
-	axienet_dma_out_addr(lp, XAXIDMA_TX_TDESC_OFFSET, tail_p);
-	if (++lp->tx_bd_tail >= lp->tx_bd_num)
-		lp->tx_bd_tail = 0;
-
-	/* Stop queue if next transmit may not have space */
-	if (axienet_check_tx_bd_space(lp, MAX_SKB_FRAGS + 1)) {
-		netif_stop_queue(ndev);
-
-		/* Matches barrier in axienet_start_xmit_done */
-		smp_mb();
-
-		/* Space might have just been freed - check again */
-		if (!axienet_check_tx_bd_space(lp, MAX_SKB_FRAGS + 1))
-			netif_wake_queue(ndev);
-	}
-
-	return NETDEV_TX_OK;
+	return axienet_queue_xmit(skb, ndev, map);
 }
 
 /**
  * axienet_recv - Is called from Axi DMA Rx Isr to complete the received
  *		  BD processing.
  * @ndev:	Pointer to net_device structure.
+ * @budget:	NAPI budget
+ * @q:		Pointer to axienet DMA queue structure
  *
- * This function is invoked from the Axi DMA Rx isr to process the Rx BDs. It
- * does minimal processing and invokes "netif_rx" to complete further
- * processing.
+ * This function is invoked from the Axi DMA Rx isr(poll) to process the Rx BDs
+ * It does minimal processing and invokes "netif_receive_skb" to complete
+ * further processing.
+ * Return: Number of BD's processed.
  */
-static void axienet_recv(struct net_device *ndev)
+static int axienet_recv(struct net_device *ndev, int budget,
+			struct axienet_dma_q *q)
 {
 	u32 length;
 	u32 csumstatus;
@@ -777,191 +1482,246 @@ static void axienet_recv(struct net_device *ndev)
 	dma_addr_t tail_p = 0;
 	struct axienet_local *lp = netdev_priv(ndev);
 	struct sk_buff *skb, *new_skb;
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	struct aximcdma_bd *cur_p;
+#else
 	struct axidma_bd *cur_p;
+#endif
+	unsigned int numbdfree = 0;
 
-	cur_p = &lp->rx_bd_v[lp->rx_bd_ci];
+	/* Get relevat BD status value */
+	rmb();
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	cur_p = &q->rxq_bd_v[q->rx_bd_ci];
+#else
+	cur_p = &q->rx_bd_v[q->rx_bd_ci];
+#endif
 
-	while ((cur_p->status & XAXIDMA_BD_STS_COMPLETE_MASK)) {
-		dma_addr_t phys;
+	while ((numbdfree < budget) &&
+	       (cur_p->status & XAXIDMA_BD_STS_COMPLETE_MASK)) {
+		new_skb = netdev_alloc_skb(ndev, lp->max_frm_size);
+		if (!new_skb) {
+			dev_err(lp->dev, "No memory for new_skb\n");
+			break;
+		}
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+		tail_p = q->rx_bd_p + sizeof(*q->rxq_bd_v) * q->rx_bd_ci;
+#else
+		tail_p = q->rx_bd_p + sizeof(*q->rx_bd_v) * q->rx_bd_ci;
+#endif
 
-		/* Ensure we see complete descriptor update */
-		dma_rmb();
+		dma_unmap_single(ndev->dev.parent, cur_p->phys,
+				 lp->max_frm_size,
+				 DMA_FROM_DEVICE);
 
-		skb = cur_p->skb;
-		cur_p->skb = NULL;
+		skb = (struct sk_buff *)(cur_p->sw_id_offset);
 
-		/* skb could be NULL if a previous pass already received the
-		 * packet for this slot in the ring, but failed to refill it
-		 * with a newly allocated buffer. In this case, don't try to
-		 * receive it again.
-		 */
-		if (likely(skb)) {
+		if (lp->eth_hasnobuf ||
+		    (lp->axienet_config->mactype != XAXIENET_1G))
+			length = cur_p->status & XAXIDMA_BD_STS_ACTUAL_LEN_MASK;
+		else
 			length = cur_p->app4 & 0x0000FFFF;
 
-			phys = desc_get_phys_addr(lp, cur_p);
-			dma_unmap_single(ndev->dev.parent, phys, lp->max_frm_size,
-					 DMA_FROM_DEVICE);
+		skb_put(skb, length);
+#ifdef CONFIG_XILINX_AXI_EMAC_HWTSTAMP
+	if (!lp->is_tsn) {
+		if ((lp->tstamp_config.rx_filter == HWTSTAMP_FILTER_ALL ||
+			lp->eth_hasptp) &&
+			(lp->axienet_config->mactype != XAXIENET_10G_25G) &&
+			(lp->axienet_config->mactype != XAXIENET_MRMAC)) {
+			u32 sec, nsec;
+			u64 time64;
+			struct skb_shared_hwtstamps *shhwtstamps;
 
-			skb_put(skb, length);
-			skb->protocol = eth_type_trans(skb, ndev);
-			/*skb_checksum_none_assert(skb);*/
-			skb->ip_summed = CHECKSUM_NONE;
+			if (lp->axienet_config->mactype == XAXIENET_1G ||
+			    lp->axienet_config->mactype == XAXIENET_2_5G) {
+				/* The first 8 bytes will be the timestamp */
+				memcpy(&sec, &skb->data[0], 4);
+				memcpy(&nsec, &skb->data[4], 4);
 
-			/* if we're doing Rx csum offload, set it up */
-			if (lp->features & XAE_FEATURE_FULL_RX_CSUM) {
-				csumstatus = (cur_p->app2 &
-					      XAE_FULL_CSUM_STATUS_MASK) >> 3;
-				if (csumstatus == XAE_IP_TCP_CSUM_VALIDATED ||
-				    csumstatus == XAE_IP_UDP_CSUM_VALIDATED) {
-					skb->ip_summed = CHECKSUM_UNNECESSARY;
-				}
-			} else if ((lp->features & XAE_FEATURE_PARTIAL_RX_CSUM) != 0 &&
-				   skb->protocol == htons(ETH_P_IP) &&
-				   skb->len > 64) {
-				skb->csum = be32_to_cpu(cur_p->app3 & 0xFFFF);
-				skb->ip_summed = CHECKSUM_COMPLETE;
+				sec = cpu_to_be32(sec);
+				nsec = cpu_to_be32(nsec);
+			} else {
+				/* The first 8 bytes will be the timestamp */
+				memcpy(&nsec, &skb->data[0], 4);
+				memcpy(&sec, &skb->data[4], 4);
 			}
 
-			netif_rx(skb);
-
-			size += length;
-			packets++;
+			/* Remove these 8 bytes from the buffer */
+			skb_pull(skb, 8);
+			time64 = sec * NS_PER_SEC + nsec;
+			shhwtstamps = skb_hwtstamps(skb);
+			shhwtstamps->hwtstamp = ns_to_ktime(time64);
+		} else if (lp->axienet_config->mactype == XAXIENET_10G_25G ||
+			   lp->axienet_config->mactype == XAXIENET_MRMAC) {
+			axienet_rx_hwtstamp(lp, skb);
 		}
+	}
+#endif
+		skb->protocol = eth_type_trans(skb, ndev);
+		/*skb_checksum_none_assert(skb);*/
+		skb->ip_summed = CHECKSUM_NONE;
 
-		new_skb = netdev_alloc_skb_ip_align(ndev, lp->max_frm_size);
-		if (!new_skb)
-			break;
-
-		phys = dma_map_single(ndev->dev.parent, new_skb->data,
-				      lp->max_frm_size,
-				      DMA_FROM_DEVICE);
-		if (unlikely(dma_mapping_error(ndev->dev.parent, phys))) {
-			if (net_ratelimit())
-				netdev_err(ndev, "RX DMA mapping error\n");
-			dev_kfree_skb(new_skb);
-			break;
+		/* if we're doing Rx csum offload, set it up */
+		if (lp->features & XAE_FEATURE_FULL_RX_CSUM &&
+		    (lp->axienet_config->mactype == XAXIENET_1G) &&
+		    !lp->eth_hasnobuf) {
+			csumstatus = (cur_p->app2 &
+				      XAE_FULL_CSUM_STATUS_MASK) >> 3;
+			if ((csumstatus == XAE_IP_TCP_CSUM_VALIDATED) ||
+			    (csumstatus == XAE_IP_UDP_CSUM_VALIDATED)) {
+				skb->ip_summed = CHECKSUM_UNNECESSARY;
+			}
+		} else if ((lp->features & XAE_FEATURE_PARTIAL_RX_CSUM) != 0 &&
+			   skb->protocol == htons(ETH_P_IP) &&
+			   skb->len > 64 && !lp->eth_hasnobuf &&
+			   (lp->axienet_config->mactype == XAXIENET_1G)) {
+			skb->csum = be32_to_cpu(cur_p->app3 & 0xFFFF);
+			skb->ip_summed = CHECKSUM_COMPLETE;
 		}
-		desc_set_phys_addr(lp, phys, cur_p);
+#ifdef CONFIG_XILINX_TSN
+		if (unlikely(q->flags & MCDMA_MGMT_CHAN)) {
+			struct net_device *ndev = NULL;
 
+			/* received packet on mgmt channel */
+			if (q->flags & MCDMA_MGMT_CHAN_PORT0)
+				ndev = lp->slaves[0];
+			else if (q->flags & MCDMA_MGMT_CHAN_PORT1)
+				ndev = lp->slaves[1];
+
+			/* send to one of the front panel port */
+			if (ndev && netif_running(ndev)) {
+				skb->dev = ndev;
+				netif_receive_skb(skb);
+			} else {
+				kfree(skb); /* dont send up the stack */
+			}
+		} else {
+			netif_receive_skb(skb); /* send on normal data path */
+		}
+#else
+
+		netif_receive_skb(skb);
+#endif
+
+		size += length;
+		packets++;
+
+		/* Ensure that the skb is completely updated
+		 * prio to mapping the DMA
+		 */
+		wmb();
+
+		cur_p->phys = dma_map_single(ndev->dev.parent, new_skb->data,
+					   lp->max_frm_size,
+					   DMA_FROM_DEVICE);
 		cur_p->cntrl = lp->max_frm_size;
 		cur_p->status = 0;
-		cur_p->skb = new_skb;
+		cur_p->sw_id_offset = (phys_addr_t)new_skb;
 
-		/* Only update tail_p to mark this slot as usable after it has
-		 * been successfully refilled.
-		 */
-		tail_p = lp->rx_bd_p + sizeof(*lp->rx_bd_v) * lp->rx_bd_ci;
+		if (++q->rx_bd_ci >= lp->rx_bd_num)
+			q->rx_bd_ci = 0;
 
-		if (++lp->rx_bd_ci >= lp->rx_bd_num)
-			lp->rx_bd_ci = 0;
-		cur_p = &lp->rx_bd_v[lp->rx_bd_ci];
+		/* Get relevat BD status value */
+		rmb();
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+		cur_p = &q->rxq_bd_v[q->rx_bd_ci];
+#else
+		cur_p = &q->rx_bd_v[q->rx_bd_ci];
+#endif
+		numbdfree++;
 	}
 
 	ndev->stats.rx_packets += packets;
 	ndev->stats.rx_bytes += size;
+	q->rx_packets += packets;
+	q->rx_bytes += size;
 
-	if (tail_p)
-		axienet_dma_out_addr(lp, XAXIDMA_RX_TDESC_OFFSET, tail_p);
+	if (tail_p) {
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+		axienet_dma_bdout(q, XMCDMA_CHAN_TAILDESC_OFFSET(q->chan_id) +
+				  q->rx_offset, tail_p);
+#else
+		axienet_dma_bdout(q, XAXIDMA_RX_TDESC_OFFSET, tail_p);
+#endif
+	}
+
+	return numbdfree;
 }
 
 /**
- * axienet_tx_irq - Tx Done Isr.
- * @irq:	irq number
- * @_ndev:	net_device pointer
+ * xaxienet_rx_poll - Poll routine for rx packets (NAPI)
+ * @napi:	napi structure pointer
+ * @quota:	Max number of rx packets to be processed.
  *
- * Return: IRQ_HANDLED if device generated a TX interrupt, IRQ_NONE otherwise.
+ * This is the poll routine for rx part.
+ * It will process the packets maximux quota value.
  *
- * This is the Axi DMA Tx done Isr. It invokes "axienet_start_xmit_done"
- * to complete the BD processing.
+ * Return: number of packets received
  */
-static irqreturn_t axienet_tx_irq(int irq, void *_ndev)
+int xaxienet_rx_poll(struct napi_struct *napi, int quota)
 {
-	u32 cr;
-	unsigned int status;
-	struct net_device *ndev = _ndev;
+	struct net_device *ndev = napi->dev;
 	struct axienet_local *lp = netdev_priv(ndev);
+	int work_done = 0;
+	unsigned int status, cr;
 
-	status = axienet_dma_in32(lp, XAXIDMA_TX_SR_OFFSET);
-	if (status & (XAXIDMA_IRQ_IOC_MASK | XAXIDMA_IRQ_DELAY_MASK)) {
-		axienet_dma_out32(lp, XAXIDMA_TX_SR_OFFSET, status);
-		axienet_start_xmit_done(lp->ndev);
-		goto out;
+	int map = napi - lp->napi;
+
+	struct axienet_dma_q *q = lp->dq[map];
+
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	spin_lock(&q->rx_lock);
+	status = axienet_dma_in32(q, XMCDMA_CHAN_SR_OFFSET(q->chan_id) +
+				  q->rx_offset);
+	while ((status & (XMCDMA_IRQ_IOC_MASK | XMCDMA_IRQ_DELAY_MASK)) &&
+	       (work_done < quota)) {
+		axienet_dma_out32(q, XMCDMA_CHAN_SR_OFFSET(q->chan_id) +
+				  q->rx_offset, status);
+		if (status & XMCDMA_IRQ_ERR_MASK) {
+			dev_err(lp->dev, "Rx error 0x%x\n\r", status);
+			break;
+		}
+		work_done += axienet_recv(lp->ndev, quota - work_done, q);
+		status = axienet_dma_in32(q, XMCDMA_CHAN_SR_OFFSET(q->chan_id) +
+					  q->rx_offset);
 	}
-	if (!(status & XAXIDMA_IRQ_ALL_MASK))
-		return IRQ_NONE;
-	if (status & XAXIDMA_IRQ_ERROR_MASK) {
-		dev_err(&ndev->dev, "DMA Tx error 0x%x\n", status);
-		dev_err(&ndev->dev, "Current BD is at: 0x%x%08x\n",
-			(lp->tx_bd_v[lp->tx_bd_ci]).phys_msb,
-			(lp->tx_bd_v[lp->tx_bd_ci]).phys);
+	spin_unlock(&q->rx_lock);
+#else
+	spin_lock(&q->rx_lock);
 
-		cr = axienet_dma_in32(lp, XAXIDMA_TX_CR_OFFSET);
-		/* Disable coalesce, delay timer and error interrupts */
-		cr &= (~XAXIDMA_IRQ_ALL_MASK);
-		/* Write to the Tx channel control register */
-		axienet_dma_out32(lp, XAXIDMA_TX_CR_OFFSET, cr);
-
-		cr = axienet_dma_in32(lp, XAXIDMA_RX_CR_OFFSET);
-		/* Disable coalesce, delay timer and error interrupts */
-		cr &= (~XAXIDMA_IRQ_ALL_MASK);
-		/* Write to the Rx channel control register */
-		axienet_dma_out32(lp, XAXIDMA_RX_CR_OFFSET, cr);
-
-		schedule_work(&lp->dma_err_task);
-		axienet_dma_out32(lp, XAXIDMA_TX_SR_OFFSET, status);
+	status = axienet_dma_in32(q, XAXIDMA_RX_SR_OFFSET);
+	while ((status & (XAXIDMA_IRQ_IOC_MASK | XAXIDMA_IRQ_DELAY_MASK)) &&
+	       (work_done < quota)) {
+		axienet_dma_out32(q, XAXIDMA_RX_SR_OFFSET, status);
+		if (status & XAXIDMA_IRQ_ERROR_MASK) {
+			dev_err(lp->dev, "Rx error 0x%x\n\r", status);
+			break;
+		}
+		work_done += axienet_recv(lp->ndev, quota - work_done, q);
+		status = axienet_dma_in32(q, XAXIDMA_RX_SR_OFFSET);
 	}
-out:
-	return IRQ_HANDLED;
-}
+	spin_unlock(&q->rx_lock);
+#endif
 
-/**
- * axienet_rx_irq - Rx Isr.
- * @irq:	irq number
- * @_ndev:	net_device pointer
- *
- * Return: IRQ_HANDLED if device generated a RX interrupt, IRQ_NONE otherwise.
- *
- * This is the Axi DMA Rx Isr. It invokes "axienet_recv" to complete the BD
- * processing.
- */
-static irqreturn_t axienet_rx_irq(int irq, void *_ndev)
-{
-	u32 cr;
-	unsigned int status;
-	struct net_device *ndev = _ndev;
-	struct axienet_local *lp = netdev_priv(ndev);
-
-	status = axienet_dma_in32(lp, XAXIDMA_RX_SR_OFFSET);
-	if (status & (XAXIDMA_IRQ_IOC_MASK | XAXIDMA_IRQ_DELAY_MASK)) {
-		axienet_dma_out32(lp, XAXIDMA_RX_SR_OFFSET, status);
-		axienet_recv(lp->ndev);
-		goto out;
+	if (work_done < quota) {
+		napi_complete(napi);
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+		/* Enable the interrupts again */
+		cr = axienet_dma_in32(q, XMCDMA_CHAN_CR_OFFSET(q->chan_id) +
+				      XMCDMA_RX_OFFSET);
+		cr |= (XMCDMA_IRQ_IOC_MASK | XMCDMA_IRQ_DELAY_MASK);
+		axienet_dma_out32(q, XMCDMA_CHAN_CR_OFFSET(q->chan_id) +
+				  XMCDMA_RX_OFFSET, cr);
+#else
+		/* Enable the interrupts again */
+		cr = axienet_dma_in32(q, XAXIDMA_RX_CR_OFFSET);
+		cr |= (XAXIDMA_IRQ_IOC_MASK | XAXIDMA_IRQ_DELAY_MASK);
+		axienet_dma_out32(q, XAXIDMA_RX_CR_OFFSET, cr);
+#endif
 	}
-	if (!(status & XAXIDMA_IRQ_ALL_MASK))
-		return IRQ_NONE;
-	if (status & XAXIDMA_IRQ_ERROR_MASK) {
-		dev_err(&ndev->dev, "DMA Rx error 0x%x\n", status);
-		dev_err(&ndev->dev, "Current BD is at: 0x%x%08x\n",
-			(lp->rx_bd_v[lp->rx_bd_ci]).phys_msb,
-			(lp->rx_bd_v[lp->rx_bd_ci]).phys);
 
-		cr = axienet_dma_in32(lp, XAXIDMA_TX_CR_OFFSET);
-		/* Disable coalesce, delay timer and error interrupts */
-		cr &= (~XAXIDMA_IRQ_ALL_MASK);
-		/* Finally write to the Tx channel control register */
-		axienet_dma_out32(lp, XAXIDMA_TX_CR_OFFSET, cr);
-
-		cr = axienet_dma_in32(lp, XAXIDMA_RX_CR_OFFSET);
-		/* Disable coalesce, delay timer and error interrupts */
-		cr &= (~XAXIDMA_IRQ_ALL_MASK);
-		/* write to the Rx channel control register */
-		axienet_dma_out32(lp, XAXIDMA_RX_CR_OFFSET, cr);
-
-		schedule_work(&lp->dma_err_task);
-		axienet_dma_out32(lp, XAXIDMA_RX_SR_OFFSET, status);
-	}
-out:
-	return IRQ_HANDLED;
+	return work_done;
 }
 
 /**
@@ -1699,8 +2459,7 @@ static int axienet_ethtools_set_ringparam(struct net_device *ndev,
 	if (ering->rx_pending > RX_BD_NUM_MAX ||
 	    ering->rx_mini_pending ||
 	    ering->rx_jumbo_pending ||
-	    ering->tx_pending < TX_BD_NUM_MIN ||
-	    ering->tx_pending > TX_BD_NUM_MAX)
+	    ering->rx_pending > TX_BD_NUM_MAX)
 		return -EINVAL;
 
 	if (netif_running(ndev))
@@ -1971,305 +2730,465 @@ static const struct ethtool_ops axienet_ethtool_ops = {
 	.get_regs       = axienet_ethtools_get_regs,
 	.get_link       = ethtool_op_get_link,
 	.get_ringparam	= axienet_ethtools_get_ringparam,
-	.set_ringparam	= axienet_ethtools_set_ringparam,
+	.set_ringparam  = axienet_ethtools_set_ringparam,
 	.get_pauseparam = axienet_ethtools_get_pauseparam,
 	.set_pauseparam = axienet_ethtools_set_pauseparam,
 	.get_coalesce   = axienet_ethtools_get_coalesce,
 	.set_coalesce   = axienet_ethtools_set_coalesce,
-	.get_link_ksettings = axienet_ethtools_get_link_ksettings,
-	.set_link_ksettings = axienet_ethtools_set_link_ksettings,
+	.get_sset_count	= axienet_ethtools_sset_count,
+	.get_ethtool_stats = axienet_ethtools_get_stats,
+	.get_strings = axienet_ethtools_strings,
+#if defined(CONFIG_XILINX_AXI_EMAC_HWTSTAMP) || defined(CONFIG_XILINX_TSN_PTP)
+	.get_ts_info    = axienet_ethtools_get_ts_info,
+#endif
+	.get_link_ksettings = phy_ethtool_get_link_ksettings,
+	.set_link_ksettings = phy_ethtool_set_link_ksettings,
 };
 
-static void axienet_validate(struct phylink_config *config,
-			     unsigned long *supported,
-			     struct phylink_link_state *state)
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+static int __maybe_unused axienet_mcdma_probe(struct platform_device *pdev,
+					      struct axienet_local *lp,
+					      struct net_device *ndev)
 {
-	struct net_device *ndev = to_net_dev(config->dev);
-	struct axienet_local *lp = netdev_priv(ndev);
-	__ETHTOOL_DECLARE_LINK_MODE_MASK(mask) = { 0, };
+	int i, ret = 0;
+	struct axienet_dma_q *q;
+	struct device_node *np;
+	struct resource dmares;
+	const char *str;
 
-	/* Only support the mode we are configured for */
-	if (state->interface != PHY_INTERFACE_MODE_NA &&
-	    state->interface != lp->phy_mode) {
-		netdev_warn(ndev, "Cannot use PHY mode %s, supported: %s\n",
-			    phy_modes(state->interface),
-			    phy_modes(lp->phy_mode));
-		bitmap_zero(supported, __ETHTOOL_LINK_MODE_MASK_NBITS);
-		return;
+	ret = of_property_count_strings(pdev->dev.of_node, "xlnx,channel-ids");
+	if (ret < 0)
+		return -EINVAL;
+
+	for_each_rx_dma_queue(lp, i) {
+		q = kzalloc(sizeof(*q), GFP_KERNEL);
+
+		/* parent */
+		q->lp = lp;
+		lp->dq[i] = q;
+		ret = of_property_read_string_index(pdev->dev.of_node,
+						    "xlnx,channel-ids", i,
+						    &str);
+		ret = kstrtou16(str, 16, &q->chan_id);
+		lp->qnum[i] = i;
+		lp->chan_num[i] = q->chan_id;
 	}
 
-	phylink_set(mask, Autoneg);
-	phylink_set_port_modes(mask);
-
-	phylink_set(mask, Asym_Pause);
-	phylink_set(mask, Pause);
-
-	switch (state->interface) {
-	case PHY_INTERFACE_MODE_NA:
-	case PHY_INTERFACE_MODE_1000BASEX:
-	case PHY_INTERFACE_MODE_SGMII:
-	case PHY_INTERFACE_MODE_GMII:
-	case PHY_INTERFACE_MODE_RGMII:
-	case PHY_INTERFACE_MODE_RGMII_ID:
-	case PHY_INTERFACE_MODE_RGMII_RXID:
-	case PHY_INTERFACE_MODE_RGMII_TXID:
-		phylink_set(mask, 1000baseX_Full);
-		phylink_set(mask, 1000baseT_Full);
-		if (state->interface == PHY_INTERFACE_MODE_1000BASEX)
-			break;
-		fallthrough;
-	case PHY_INTERFACE_MODE_MII:
-		phylink_set(mask, 100baseT_Full);
-		phylink_set(mask, 10baseT_Full);
-	default:
-		break;
+	np = of_parse_phandle(pdev->dev.of_node, "axistream-connected",
+			      0);
+	if (IS_ERR(np)) {
+		dev_err(&pdev->dev, "could not find DMA node\n");
+		return ret;
 	}
 
-	bitmap_and(supported, supported, mask,
-		   __ETHTOOL_LINK_MODE_MASK_NBITS);
-	bitmap_and(state->advertising, state->advertising, mask,
-		   __ETHTOOL_LINK_MODE_MASK_NBITS);
-}
-
-static void axienet_mac_pcs_get_state(struct phylink_config *config,
-				      struct phylink_link_state *state)
-{
-	struct net_device *ndev = to_net_dev(config->dev);
-	struct axienet_local *lp = netdev_priv(ndev);
-
-	switch (state->interface) {
-	case PHY_INTERFACE_MODE_SGMII:
-	case PHY_INTERFACE_MODE_1000BASEX:
-		phylink_mii_c22_pcs_get_state(lp->pcs_phy, state);
-		break;
-	default:
-		break;
-	}
-}
-
-static void axienet_mac_an_restart(struct phylink_config *config)
-{
-	struct net_device *ndev = to_net_dev(config->dev);
-	struct axienet_local *lp = netdev_priv(ndev);
-
-	phylink_mii_c22_pcs_an_restart(lp->pcs_phy);
-}
-
-static void axienet_mac_config(struct phylink_config *config, unsigned int mode,
-			       const struct phylink_link_state *state)
-{
-	struct net_device *ndev = to_net_dev(config->dev);
-	struct axienet_local *lp = netdev_priv(ndev);
-	int ret;
-
-	switch (state->interface) {
-	case PHY_INTERFACE_MODE_SGMII:
-	case PHY_INTERFACE_MODE_1000BASEX:
-		ret = phylink_mii_c22_pcs_config(lp->pcs_phy, mode,
-						 state->interface,
-						 state->advertising);
-		if (ret < 0)
-			netdev_warn(ndev, "Failed to configure PCS: %d\n",
-				    ret);
-		break;
-
-	default:
-		break;
-	}
-}
-
-static void axienet_mac_link_down(struct phylink_config *config,
-				  unsigned int mode,
-				  phy_interface_t interface)
-{
-	/* nothing meaningful to do */
-}
-
-static void axienet_mac_link_up(struct phylink_config *config,
-				struct phy_device *phy,
-				unsigned int mode, phy_interface_t interface,
-				int speed, int duplex,
-				bool tx_pause, bool rx_pause)
-{
-	struct net_device *ndev = to_net_dev(config->dev);
-	struct axienet_local *lp = netdev_priv(ndev);
-	u32 emmc_reg, fcc_reg;
-
-	emmc_reg = axienet_ior(lp, XAE_EMMC_OFFSET);
-	emmc_reg &= ~XAE_EMMC_LINKSPEED_MASK;
-
-	switch (speed) {
-	case SPEED_1000:
-		emmc_reg |= XAE_EMMC_LINKSPD_1000;
-		break;
-	case SPEED_100:
-		emmc_reg |= XAE_EMMC_LINKSPD_100;
-		break;
-	case SPEED_10:
-		emmc_reg |= XAE_EMMC_LINKSPD_10;
-		break;
-	default:
-		dev_err(&ndev->dev,
-			"Speed other than 10, 100 or 1Gbps is not supported\n");
-		break;
+	ret = of_address_to_resource(np, 0, &dmares);
+	if (ret) {
+		dev_err(&pdev->dev, "unable to get DMA resource\n");
+		return ret;
 	}
 
-	axienet_iow(lp, XAE_EMMC_OFFSET, emmc_reg);
+	ret = of_property_read_u8(np, "xlnx,addrwidth", (u8 *)&lp->dma_mask);
+	if (ret < 0 || lp->dma_mask < XAE_DMA_MASK_MIN ||
+	    lp->dma_mask > XAE_DMA_MASK_MAX) {
+		dev_info(&pdev->dev, "missing/invalid xlnx,addrwidth property, using default\n");
+		lp->dma_mask = XAE_DMA_MASK_MIN;
+	}
 
-	fcc_reg = axienet_ior(lp, XAE_FCC_OFFSET);
-	if (tx_pause)
-		fcc_reg |= XAE_FCC_FCTX_MASK;
-	else
-		fcc_reg &= ~XAE_FCC_FCTX_MASK;
-	if (rx_pause)
-		fcc_reg |= XAE_FCC_FCRX_MASK;
-	else
-		fcc_reg &= ~XAE_FCC_FCRX_MASK;
-	axienet_iow(lp, XAE_FCC_OFFSET, fcc_reg);
+	lp->mcdma_regs = devm_ioremap_resource(&pdev->dev, &dmares);
+	if (IS_ERR(lp->mcdma_regs)) {
+		dev_err(&pdev->dev, "iormeap failed for the dma\n");
+		ret = PTR_ERR(lp->mcdma_regs);
+		return ret;
+	}
+
+	axienet_mcdma_tx_probe(pdev, np, lp);
+	axienet_mcdma_rx_probe(pdev, lp, ndev);
+
+	return 0;
 }
+#endif
 
-static const struct phylink_mac_ops axienet_phylink_ops = {
-	.validate = axienet_validate,
-	.mac_pcs_get_state = axienet_mac_pcs_get_state,
-	.mac_an_restart = axienet_mac_an_restart,
-	.mac_config = axienet_mac_config,
-	.mac_link_down = axienet_mac_link_down,
-	.mac_link_up = axienet_mac_link_up,
-};
-
-/**
- * axienet_dma_err_handler - Work queue task for Axi DMA Error
- * @work:	pointer to work_struct
- *
- * Resets the Axi DMA and Axi Ethernet devices, and reconfigures the
- * Tx/Rx BDs.
- */
-static void axienet_dma_err_handler(struct work_struct *work)
+static int __maybe_unused axienet_dma_probe(struct platform_device *pdev,
+					    struct net_device *ndev)
 {
-	u32 axienet_status;
-	u32 cr, i;
-	struct axienet_local *lp = container_of(work, struct axienet_local,
-						dma_err_task);
-	struct net_device *ndev = lp->ndev;
-	struct axidma_bd *cur_p;
+	int i, ret;
+	struct axienet_local *lp = netdev_priv(ndev);
+	struct axienet_dma_q *q;
+	struct device_node *np = NULL;
+	struct resource dmares;
 
-	axienet_setoptions(ndev, lp->options &
-			   ~(XAE_OPTION_TXEN | XAE_OPTION_RXEN));
-	/* Disable the MDIO interface till Axi Ethernet Reset is completed.
-	 * When we do an Axi Ethernet reset, it resets the complete core
-	 * including the MDIO. MDIO must be disabled before resetting
-	 * and re-enabled afterwards.
-	 * Hold MDIO bus lock to avoid MDIO accesses during the reset.
-	 */
-	mutex_lock(&lp->mii_bus->mdio_lock);
-	axienet_mdio_disable(lp);
-	__axienet_device_reset(lp);
-	axienet_mdio_enable(lp);
-	mutex_unlock(&lp->mii_bus->mdio_lock);
+	for_each_rx_dma_queue(lp, i) {
+		q = devm_kzalloc(&pdev->dev, sizeof(*q), GFP_KERNEL);
+		if (!q)
+			return -ENOMEM;
 
-	for (i = 0; i < lp->tx_bd_num; i++) {
-		cur_p = &lp->tx_bd_v[i];
-		if (cur_p->cntrl) {
-			dma_addr_t addr = desc_get_phys_addr(lp, cur_p);
+		/* parent */
+		q->lp = lp;
 
-			dma_unmap_single(ndev->dev.parent, addr,
-					 (cur_p->cntrl &
-					  XAXIDMA_BD_CTRL_LENGTH_MASK),
-					 DMA_TO_DEVICE);
+		lp->dq[i] = q;
+	}
+
+	/* Find the DMA node, map the DMA registers, and decode the DMA IRQs */
+	/* TODO handle error ret */
+	for_each_rx_dma_queue(lp, i) {
+		q = lp->dq[i];
+
+		np = of_parse_phandle(pdev->dev.of_node, "axistream-connected",
+				      i);
+		if (np) {
+			ret = of_address_to_resource(np, 0, &dmares);
+			if (ret >= 0) {
+				q->dma_regs = devm_ioremap_resource(&pdev->dev,
+								    &dmares);
+			} else {
+				dev_err(&pdev->dev, "unable to get DMA resource for %pOF\n",
+					np);
+				return -ENODEV;
+			}
+			q->eth_hasdre = of_property_read_bool(np,
+							      "xlnx,include-dre");
+			ret = of_property_read_u8(np, "xlnx,addrwidth",
+						  (u8 *)&lp->dma_mask);
+			if (ret <  0 || lp->dma_mask < XAE_DMA_MASK_MIN ||
+			    lp->dma_mask > XAE_DMA_MASK_MAX) {
+				dev_info(&pdev->dev, "missing/invalid xlnx,addrwidth property, using default\n");
+				lp->dma_mask = XAE_DMA_MASK_MIN;
+			}
+
+		} else {
+			dev_err(&pdev->dev, "missing axistream-connected property\n");
+			return -EINVAL;
 		}
-		if (cur_p->skb)
-			dev_kfree_skb_irq(cur_p->skb);
-		cur_p->phys = 0;
-		cur_p->phys_msb = 0;
-		cur_p->cntrl = 0;
-		cur_p->status = 0;
-		cur_p->app0 = 0;
-		cur_p->app1 = 0;
-		cur_p->app2 = 0;
-		cur_p->app3 = 0;
-		cur_p->app4 = 0;
-		cur_p->skb = NULL;
+		lp->dq[i]->tx_irq = irq_of_parse_and_map(np, 0);
+		lp->dq[i]->rx_irq = irq_of_parse_and_map(np, 1);
+
 	}
 
-	for (i = 0; i < lp->rx_bd_num; i++) {
-		cur_p = &lp->rx_bd_v[i];
-		cur_p->status = 0;
-		cur_p->app0 = 0;
-		cur_p->app1 = 0;
-		cur_p->app2 = 0;
-		cur_p->app3 = 0;
-		cur_p->app4 = 0;
+	of_node_put(np);
+
+	for_each_rx_dma_queue(lp, i) {
+		struct axienet_dma_q *q = lp->dq[i];
+
+		spin_lock_init(&q->tx_lock);
+		spin_lock_init(&q->rx_lock);
 	}
 
-	lp->tx_bd_ci = 0;
-	lp->tx_bd_tail = 0;
-	lp->rx_bd_ci = 0;
+	for_each_rx_dma_queue(lp, i) {
+		netif_napi_add(ndev, &lp->napi[i], xaxienet_rx_poll,
+			       XAXIENET_NAPI_WEIGHT);
+	}
 
-	/* Start updating the Rx channel control register */
-	cr = axienet_dma_in32(lp, XAXIDMA_RX_CR_OFFSET);
-	/* Update the interrupt coalesce count */
-	cr = ((cr & ~XAXIDMA_COALESCE_MASK) |
-	      (XAXIDMA_DFT_RX_THRESHOLD << XAXIDMA_COALESCE_SHIFT));
-	/* Update the delay timer count */
-	cr = ((cr & ~XAXIDMA_DELAY_MASK) |
-	      (XAXIDMA_DFT_RX_WAITBOUND << XAXIDMA_DELAY_SHIFT));
-	/* Enable coalesce, delay timer and error interrupts */
-	cr |= XAXIDMA_IRQ_ALL_MASK;
-	/* Finally write to the Rx channel control register */
-	axienet_dma_out32(lp, XAXIDMA_RX_CR_OFFSET, cr);
-
-	/* Start updating the Tx channel control register */
-	cr = axienet_dma_in32(lp, XAXIDMA_TX_CR_OFFSET);
-	/* Update the interrupt coalesce count */
-	cr = (((cr & ~XAXIDMA_COALESCE_MASK)) |
-	      (XAXIDMA_DFT_TX_THRESHOLD << XAXIDMA_COALESCE_SHIFT));
-	/* Update the delay timer count */
-	cr = (((cr & ~XAXIDMA_DELAY_MASK)) |
-	      (XAXIDMA_DFT_TX_WAITBOUND << XAXIDMA_DELAY_SHIFT));
-	/* Enable coalesce, delay timer and error interrupts */
-	cr |= XAXIDMA_IRQ_ALL_MASK;
-	/* Finally write to the Tx channel control register */
-	axienet_dma_out32(lp, XAXIDMA_TX_CR_OFFSET, cr);
-
-	/* Populate the tail pointer and bring the Rx Axi DMA engine out of
-	 * halted state. This will make the Rx side ready for reception.
-	 */
-	axienet_dma_out_addr(lp, XAXIDMA_RX_CDESC_OFFSET, lp->rx_bd_p);
-	cr = axienet_dma_in32(lp, XAXIDMA_RX_CR_OFFSET);
-	axienet_dma_out32(lp, XAXIDMA_RX_CR_OFFSET,
-			  cr | XAXIDMA_CR_RUNSTOP_MASK);
-	axienet_dma_out_addr(lp, XAXIDMA_RX_TDESC_OFFSET, lp->rx_bd_p +
-			     (sizeof(*lp->rx_bd_v) * (lp->rx_bd_num - 1)));
-
-	/* Write to the RS (Run-stop) bit in the Tx channel control register.
-	 * Tx channel is now ready to run. But only after we write to the
-	 * tail pointer register that the Tx channel will start transmitting
-	 */
-	axienet_dma_out_addr(lp, XAXIDMA_TX_CDESC_OFFSET, lp->tx_bd_p);
-	cr = axienet_dma_in32(lp, XAXIDMA_TX_CR_OFFSET);
-	axienet_dma_out32(lp, XAXIDMA_TX_CR_OFFSET,
-			  cr | XAXIDMA_CR_RUNSTOP_MASK);
-
-	axienet_status = axienet_ior(lp, XAE_RCW1_OFFSET);
-	axienet_status &= ~XAE_RCW1_RX_MASK;
-	axienet_iow(lp, XAE_RCW1_OFFSET, axienet_status);
-
-	axienet_status = axienet_ior(lp, XAE_IP_OFFSET);
-	if (axienet_status & XAE_INT_RXRJECT_MASK)
-		axienet_iow(lp, XAE_IS_OFFSET, XAE_INT_RXRJECT_MASK);
-	axienet_iow(lp, XAE_IE_OFFSET, lp->eth_irq > 0 ?
-		    XAE_INT_RECV_ERROR_MASK : 0);
-	axienet_iow(lp, XAE_FCC_OFFSET, XAE_FCC_FCRX_MASK);
-
-	/* Sync default options with HW but leave receiver and
-	 * transmitter disabled.
-	 */
-	axienet_setoptions(ndev, lp->options &
-			   ~(XAE_OPTION_TXEN | XAE_OPTION_RXEN));
-	axienet_set_mac_address(ndev, NULL);
-	axienet_set_multicast_list(ndev);
-	axienet_setoptions(ndev, lp->options);
+	return 0;
 }
+
+static int axienet_clk_init(struct platform_device *pdev,
+			    struct clk **axi_aclk, struct clk **axis_clk,
+			    struct clk **ref_clk, struct clk **tmpclk)
+{
+	int err;
+
+	*tmpclk = NULL;
+
+	/* The "ethernet_clk" is deprecated and will be removed sometime in
+	 * the future. For proper clock usage check axiethernet binding
+	 * documentation.
+	 */
+	*axi_aclk = devm_clk_get(&pdev->dev, "ethernet_clk");
+	if (IS_ERR(*axi_aclk)) {
+		if (PTR_ERR(*axi_aclk) != -ENOENT) {
+			err = PTR_ERR(*axi_aclk);
+			return err;
+		}
+
+		*axi_aclk = devm_clk_get(&pdev->dev, "s_axi_lite_clk");
+		if (IS_ERR(*axi_aclk)) {
+			if (PTR_ERR(*axi_aclk) != -ENOENT) {
+				err = PTR_ERR(*axi_aclk);
+				return err;
+			}
+			*axi_aclk = NULL;
+		}
+
+	} else {
+		dev_warn(&pdev->dev, "ethernet_clk is deprecated and will be removed sometime in the future\n");
+	}
+
+	*axis_clk = devm_clk_get(&pdev->dev, "axis_clk");
+	if (IS_ERR(*axis_clk)) {
+		if (PTR_ERR(*axis_clk) != -ENOENT) {
+			err = PTR_ERR(*axis_clk);
+			return err;
+		}
+		*axis_clk = NULL;
+	}
+
+	*ref_clk = devm_clk_get(&pdev->dev, "ref_clk");
+	if (IS_ERR(*ref_clk)) {
+		if (PTR_ERR(*ref_clk) != -ENOENT) {
+			err = PTR_ERR(*ref_clk);
+			return err;
+		}
+		*ref_clk = NULL;
+	}
+
+	err = clk_prepare_enable(*axi_aclk);
+	if (err) {
+		dev_err(&pdev->dev, "failed to enable axi_aclk/ethernet_clk (%d)\n", err);
+		return err;
+	}
+
+	err = clk_prepare_enable(*axis_clk);
+	if (err) {
+		dev_err(&pdev->dev, "failed to enable axis_clk (%d)\n", err);
+		goto err_disable_axi_aclk;
+	}
+
+	err = clk_prepare_enable(*ref_clk);
+	if (err) {
+		dev_err(&pdev->dev, "failed to enable ref_clk (%d)\n", err);
+		goto err_disable_axis_clk;
+	}
+
+	return 0;
+
+err_disable_axis_clk:
+	clk_disable_unprepare(*axis_clk);
+err_disable_axi_aclk:
+	clk_disable_unprepare(*axi_aclk);
+
+	return err;
+}
+
+static int axienet_dma_clk_init(struct platform_device *pdev)
+{
+	int err;
+	struct net_device *ndev = platform_get_drvdata(pdev);
+	struct axienet_local *lp = netdev_priv(ndev);
+
+	/* The "dma_clk" is deprecated and will be removed sometime in
+	 * the future. For proper clock usage check axiethernet binding
+	 * documentation.
+	 */
+	lp->dma_tx_clk = devm_clk_get(&pdev->dev, "dma_clk");
+	if (IS_ERR(lp->dma_tx_clk)) {
+		if (PTR_ERR(lp->dma_tx_clk) != -ENOENT) {
+			err = PTR_ERR(lp->dma_tx_clk);
+			return err;
+		}
+
+		lp->dma_tx_clk = devm_clk_get(&pdev->dev, "m_axi_mm2s_aclk");
+		if (IS_ERR(lp->dma_tx_clk)) {
+			if (PTR_ERR(lp->dma_tx_clk) != -ENOENT) {
+				err = PTR_ERR(lp->dma_tx_clk);
+				return err;
+			}
+			lp->dma_tx_clk = NULL;
+		}
+	} else {
+		dev_warn(&pdev->dev, "dma_clk is deprecated and will be removed sometime in the future\n");
+	}
+
+	lp->dma_rx_clk = devm_clk_get(&pdev->dev, "m_axi_s2mm_aclk");
+	if (IS_ERR(lp->dma_rx_clk)) {
+		if (PTR_ERR(lp->dma_rx_clk) != -ENOENT) {
+			err = PTR_ERR(lp->dma_rx_clk);
+			return err;
+		}
+		lp->dma_rx_clk = NULL;
+	}
+
+	lp->dma_sg_clk = devm_clk_get(&pdev->dev, "m_axi_sg_aclk");
+	if (IS_ERR(lp->dma_sg_clk)) {
+		if (PTR_ERR(lp->dma_sg_clk) != -ENOENT) {
+			err = PTR_ERR(lp->dma_sg_clk);
+			return err;
+		}
+		lp->dma_sg_clk = NULL;
+	}
+
+	err = clk_prepare_enable(lp->dma_tx_clk);
+	if (err) {
+		dev_err(&pdev->dev, "failed to enable tx_clk/dma_clk (%d)\n", err);
+		return err;
+	}
+
+	err = clk_prepare_enable(lp->dma_rx_clk);
+	if (err) {
+		dev_err(&pdev->dev, "failed to enable rx_clk (%d)\n", err);
+		goto err_disable_txclk;
+	}
+
+	err = clk_prepare_enable(lp->dma_sg_clk);
+	if (err) {
+		dev_err(&pdev->dev, "failed to enable sg_clk (%d)\n", err);
+		goto err_disable_rxclk;
+	}
+
+	return 0;
+
+err_disable_rxclk:
+	clk_disable_unprepare(lp->dma_rx_clk);
+err_disable_txclk:
+	clk_disable_unprepare(lp->dma_tx_clk);
+
+	return err;
+}
+
+static void axienet_clk_disable(struct platform_device *pdev)
+{
+	struct net_device *ndev = platform_get_drvdata(pdev);
+	struct axienet_local *lp = netdev_priv(ndev);
+
+	clk_disable_unprepare(lp->dma_sg_clk);
+	clk_disable_unprepare(lp->dma_tx_clk);
+	clk_disable_unprepare(lp->dma_rx_clk);
+	clk_disable_unprepare(lp->eth_sclk);
+	clk_disable_unprepare(lp->eth_refclk);
+	clk_disable_unprepare(lp->eth_dclk);
+	clk_disable_unprepare(lp->aclk);
+}
+
+static int xxvenet_clk_init(struct platform_device *pdev,
+			    struct clk **axi_aclk, struct clk **axis_clk,
+			    struct clk **tmpclk, struct clk **dclk)
+{
+	int err;
+
+	*tmpclk = NULL;
+
+	/* The "ethernet_clk" is deprecated and will be removed sometime in
+	 * the future. For proper clock usage check axiethernet binding
+	 * documentation.
+	 */
+	*axi_aclk = devm_clk_get(&pdev->dev, "ethernet_clk");
+	if (IS_ERR(*axi_aclk)) {
+		if (PTR_ERR(*axi_aclk) != -ENOENT) {
+			err = PTR_ERR(*axi_aclk);
+			return err;
+		}
+
+		*axi_aclk = devm_clk_get(&pdev->dev, "s_axi_aclk");
+		if (IS_ERR(*axi_aclk)) {
+			if (PTR_ERR(*axi_aclk) != -ENOENT) {
+				err = PTR_ERR(*axi_aclk);
+				return err;
+			}
+			*axi_aclk = NULL;
+		}
+
+	} else {
+		dev_warn(&pdev->dev, "ethernet_clk is deprecated and will be removed sometime in the future\n");
+	}
+
+	*axis_clk = devm_clk_get(&pdev->dev, "rx_core_clk");
+	if (IS_ERR(*axis_clk)) {
+		if (PTR_ERR(*axis_clk) != -ENOENT) {
+			err = PTR_ERR(*axis_clk);
+			return err;
+		}
+		*axis_clk = NULL;
+	}
+
+	*dclk = devm_clk_get(&pdev->dev, "dclk");
+	if (IS_ERR(*dclk)) {
+		if (PTR_ERR(*dclk) != -ENOENT) {
+			err = PTR_ERR(*dclk);
+			return err;
+		}
+		*dclk = NULL;
+	}
+
+	err = clk_prepare_enable(*axi_aclk);
+	if (err) {
+		dev_err(&pdev->dev, "failed to enable axi_clk/ethernet_clk (%d)\n", err);
+		return err;
+	}
+
+	err = clk_prepare_enable(*axis_clk);
+	if (err) {
+		dev_err(&pdev->dev, "failed to enable axis_clk (%d)\n", err);
+		goto err_disable_axi_aclk;
+	}
+
+	err = clk_prepare_enable(*dclk);
+	if (err) {
+		dev_err(&pdev->dev, "failed to enable dclk (%d)\n", err);
+		goto err_disable_axis_clk;
+	}
+
+	return 0;
+
+err_disable_axis_clk:
+	clk_disable_unprepare(*axis_clk);
+err_disable_axi_aclk:
+	clk_disable_unprepare(*axi_aclk);
+
+	return err;
+}
+
+static const struct axienet_config axienet_1g_config = {
+	.mactype = XAXIENET_1G,
+	.setoptions = axienet_setoptions,
+	.clk_init = axienet_clk_init,
+	.tx_ptplen = XAE_TX_PTP_LEN,
+};
+
+static const struct axienet_config axienet_2_5g_config = {
+	.mactype = XAXIENET_2_5G,
+	.setoptions = axienet_setoptions,
+	.clk_init = axienet_clk_init,
+	.tx_ptplen = XAE_TX_PTP_LEN,
+};
+
+static const struct axienet_config axienet_10g_config = {
+	.mactype = XAXIENET_LEGACY_10G,
+	.setoptions = axienet_setoptions,
+	.clk_init = xxvenet_clk_init,
+	.tx_ptplen = XAE_TX_PTP_LEN,
+};
+
+static const struct axienet_config axienet_10g25g_config = {
+	.mactype = XAXIENET_10G_25G,
+	.setoptions = xxvenet_setoptions,
+	.clk_init = xxvenet_clk_init,
+	.tx_ptplen = XXV_TX_PTP_LEN,
+	.ts_header_len = XXVENET_TS_HEADER_LEN,
+};
+
+static const struct axienet_config axienet_usxgmii_config = {
+	.mactype = XAXIENET_10G_25G,
+	.setoptions = xxvenet_setoptions,
+	.clk_init = xxvenet_clk_init,
+	.tx_ptplen = 0,
+};
+
+static const struct axienet_config axienet_mrmac_config = {
+	.mactype = XAXIENET_MRMAC,
+	.setoptions = xxvenet_setoptions,
+	.clk_init = xxvenet_clk_init,
+	.tx_ptplen = XXV_TX_PTP_LEN,
+	.ts_header_len = MRMAC_TS_HEADER_LEN,
+};
+
+/* Match table for of_platform binding */
+static const struct of_device_id axienet_of_match[] = {
+	{ .compatible = "xlnx,axi-ethernet-1.00.a", .data = &axienet_1g_config},
+	{ .compatible = "xlnx,axi-ethernet-1.01.a", .data = &axienet_1g_config},
+	{ .compatible = "xlnx,axi-ethernet-2.01.a", .data = &axienet_1g_config},
+	{ .compatible = "xlnx,axi-2_5-gig-ethernet-1.0",
+						.data = &axienet_2_5g_config},
+	{ .compatible = "xlnx,ten-gig-eth-mac", .data = &axienet_10g_config},
+	{ .compatible = "xlnx,xxv-ethernet-1.0",
+						.data = &axienet_10g25g_config},
+	{ .compatible = "xlnx,tsn-ethernet-1.00.a", .data = &axienet_1g_config},
+	{ .compatible = "xlnx,xxv-usxgmii-ethernet-1.0",
+					.data = &axienet_usxgmii_config},
+	{ .compatible = "xlnx,mrmac-ethernet-1.0",
+					.data = &axienet_mrmac_config},
+	{},
+};
+
+MODULE_DEVICE_TABLE(of, axienet_of_match);
 
 /**
  * axienet_probe - Axi Ethernet probe function.
@@ -2346,27 +3265,25 @@ static int axienet_probe(struct platform_device *pdev)
 	lp->ndev = ndev;
 	lp->dev = &pdev->dev;
 	lp->options = XAE_OPTION_DEFAULTS;
+	lp->num_tx_queues = num_queues;
+	lp->num_rx_queues = num_queues;
+	lp->is_tsn = is_tsn;
 	lp->rx_bd_num = RX_BD_NUM_DEFAULT;
 	lp->tx_bd_num = TX_BD_NUM_DEFAULT;
 
-	lp->clk = devm_clk_get_optional(&pdev->dev, NULL);
-	if (IS_ERR(lp->clk)) {
-		ret = PTR_ERR(lp->clk);
-		goto free_netdev;
-	}
-	ret = clk_prepare_enable(lp->clk);
-	if (ret) {
-		dev_err(&pdev->dev, "Unable to enable clock: %d\n", ret);
-		goto free_netdev;
-	}
+#ifdef CONFIG_XILINX_TSN
+	ret = of_property_read_u16(pdev->dev.of_node, "xlnx,num-tc",
+				   &lp->num_tc);
+	if (ret || (lp->num_tc != 2 && lp->num_tc != 3))
+		lp->num_tc = XAE_MAX_TSN_TC;
+#endif
 
 	/* Map device registers */
 	ethres = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	lp->regs = devm_ioremap_resource(&pdev->dev, ethres);
 	if (IS_ERR(lp->regs)) {
-		dev_err(&pdev->dev, "could not map Axi Ethernet regs.\n");
 		ret = PTR_ERR(lp->regs);
-		goto cleanup_clk;
+		goto free_netdev;
 	}
 	lp->regs_start = ethres->start;
 
@@ -2433,104 +3350,213 @@ static int axienet_probe(struct platform_device *pdev)
 	 */
 	of_property_read_u32(pdev->dev.of_node, "xlnx,rxmem", &lp->rxmem);
 
-	/* Start with the proprietary, and broken phy_type */
-	ret = of_property_read_u32(pdev->dev.of_node, "xlnx,phy-type", &value);
-	if (!ret) {
-		netdev_warn(ndev, "Please upgrade your device tree binary blob to use phy-mode");
-		switch (value) {
-		case XAE_PHY_TYPE_MII:
-			lp->phy_mode = PHY_INTERFACE_MODE_MII;
-			break;
-		case XAE_PHY_TYPE_GMII:
-			lp->phy_mode = PHY_INTERFACE_MODE_GMII;
-			break;
-		case XAE_PHY_TYPE_RGMII_2_0:
-			lp->phy_mode = PHY_INTERFACE_MODE_RGMII_ID;
-			break;
-		case XAE_PHY_TYPE_SGMII:
-			lp->phy_mode = PHY_INTERFACE_MODE_SGMII;
-			break;
-		case XAE_PHY_TYPE_1000BASE_X:
-			lp->phy_mode = PHY_INTERFACE_MODE_1000BASEX;
-			break;
-		default:
-			ret = -EINVAL;
-			goto cleanup_clk;
+	/* The phy_mode is optional but when it is not specified it should not
+	 *  be a value that alters the driver behavior so set it to an invalid
+	 *  value as the default.
+	 */
+	lp->phy_mode = PHY_INTERFACE_MODE_NA;
+	ret = of_property_read_u32(pdev->dev.of_node, "xlnx,phy-type", &lp->phy_mode);
+	if (!ret)
+		netdev_warn(ndev, "xlnx,phy-type is deprecated, Please upgrade your device tree to use phy-mode");
+
+	/* Set default USXGMII rate */
+	lp->usxgmii_rate = SPEED_1000;
+	of_property_read_u32(pdev->dev.of_node, "xlnx,usxgmii-rate",
+			     &lp->usxgmii_rate);
+
+	/* Set default MRMAC rate */
+	lp->mrmac_rate = SPEED_10000;
+	of_property_read_u32(pdev->dev.of_node, "xlnx,mrmac-rate",
+			     &lp->mrmac_rate);
+
+	lp->eth_hasnobuf = of_property_read_bool(pdev->dev.of_node,
+						 "xlnx,eth-hasnobuf");
+	lp->eth_hasptp = of_property_read_bool(pdev->dev.of_node,
+					       "xlnx,eth-hasptp");
+
+	if ((lp->axienet_config->mactype == XAXIENET_1G) && !lp->eth_hasnobuf)
+		lp->eth_irq = platform_get_irq(pdev, 0);
+
+	if (lp->axienet_config->mactype == XAXIENET_MRMAC) {
+		struct resource gtpll, gtctrl;
+
+		if (mrmac_pll_reg) {
+			lp->gt_pll = mrmac_gt_pll;
+			lp->gt_ctrl = mrmac_gt_ctrl;
+		} else {
+			np = of_parse_phandle(pdev->dev.of_node,
+					      "xlnx,gtpll", 0);
+			if (IS_ERR(np)) {
+				dev_err(&pdev->dev,
+					"couldn't find GT PLL\n");
+				ret = PTR_ERR(np);
+				goto free_netdev;
+			}
+
+			ret = of_address_to_resource(np, 0, &gtpll);
+			if (ret) {
+				dev_err(&pdev->dev,
+					"unable to get GT PLL resource\n");
+				goto free_netdev;
+			}
+
+			lp->gt_pll = devm_ioremap_resource(&pdev->dev,
+							   &gtpll);
+			if (IS_ERR(lp->gt_pll)) {
+				dev_err(&pdev->dev,
+					"couldn't map GT PLL regs\n");
+				ret = PTR_ERR(lp->gt_pll);
+				goto free_netdev;
+			}
+
+			np = of_parse_phandle(pdev->dev.of_node,
+					      "xlnx,gtctrl", 0);
+			if (IS_ERR(np)) {
+				dev_err(&pdev->dev,
+					"couldn't find GT control\n");
+				ret = PTR_ERR(np);
+				goto free_netdev;
+			}
+
+			ret = of_address_to_resource(np, 0, &gtctrl);
+			if (ret) {
+				dev_err(&pdev->dev,
+					"unable to get GT control resource\n");
+				goto free_netdev;
+			}
+
+			lp->gt_ctrl = devm_ioremap_resource(&pdev->dev,
+							    &gtctrl);
+			if (IS_ERR(lp->gt_ctrl)) {
+				dev_err(&pdev->dev,
+					"couldn't map GT control regs\n");
+				ret = PTR_ERR(lp->gt_ctrl);
+				goto free_netdev;
+			}
+
+			mrmac_gt_pll = lp->gt_pll;
+			mrmac_gt_ctrl = lp->gt_ctrl;
+			mrmac_pll_reg = 1;
 		}
-	} else {
-		ret = of_get_phy_mode(pdev->dev.of_node, &lp->phy_mode);
+#ifdef CONFIG_XILINX_AXI_EMAC_HWTSTAMP
+		ret = of_property_read_u32(pdev->dev.of_node, "xlnx,phcindex",
+					   &lp->phc_index);
 		if (ret)
-			goto cleanup_clk;
+			dev_warn(&pdev->dev, "No phc index defaulting to 0\n");
+#endif
+		ret = of_property_read_u32(pdev->dev.of_node, "xlnx,gtlane",
+					   &lp->gt_lane);
+		if (ret) {
+			dev_err(&pdev->dev, "MRMAC GT lane information missing\n");
+			goto free_netdev;
+		}
+		dev_info(&pdev->dev, "GT lane: %d\n", lp->gt_lane);
 	}
 
-	/* Find the DMA node, map the DMA registers, and decode the DMA IRQs */
-	np = of_parse_phandle(pdev->dev.of_node, "axistream-connected", 0);
-	if (np) {
-		struct resource dmares;
+#ifdef CONFIG_XILINX_AXI_EMAC_HWTSTAMP
+	if (!lp->is_tsn) {
+		struct resource txtsres, rxtsres;
 
-		ret = of_address_to_resource(np, 0, &dmares);
+		/* Find AXI Stream FIFO */
+		np = of_parse_phandle(pdev->dev.of_node, "axififo-connected",
+				      0);
+		if (IS_ERR(np)) {
+			dev_err(&pdev->dev, "could not find TX Timestamp FIFO\n");
+			ret = PTR_ERR(np);
+			goto free_netdev;
+		}
+
+		ret = of_address_to_resource(np, 0, &txtsres);
 		if (ret) {
 			dev_err(&pdev->dev,
-				"unable to get DMA resource\n");
-			of_node_put(np);
-			goto cleanup_clk;
+				"unable to get Tx Timestamp resource\n");
+			goto free_netdev;
 		}
-		lp->dma_regs = devm_ioremap_resource(&pdev->dev,
-						     &dmares);
-		lp->rx_irq = irq_of_parse_and_map(np, 1);
-		lp->tx_irq = irq_of_parse_and_map(np, 0);
-		of_node_put(np);
-		lp->eth_irq = platform_get_irq_optional(pdev, 0);
-	} else {
-		/* Check for these resources directly on the Ethernet node. */
-		struct resource *res = platform_get_resource(pdev,
-							     IORESOURCE_MEM, 1);
-		lp->dma_regs = devm_ioremap_resource(&pdev->dev, res);
-		lp->rx_irq = platform_get_irq(pdev, 1);
-		lp->tx_irq = platform_get_irq(pdev, 0);
-		lp->eth_irq = platform_get_irq_optional(pdev, 2);
-	}
-	if (IS_ERR(lp->dma_regs)) {
-		dev_err(&pdev->dev, "could not map DMA regs\n");
-		ret = PTR_ERR(lp->dma_regs);
-		goto cleanup_clk;
-	}
-	if ((lp->rx_irq <= 0) || (lp->tx_irq <= 0)) {
-		dev_err(&pdev->dev, "could not determine irqs\n");
-		ret = -ENOMEM;
-		goto cleanup_clk;
-	}
 
-	/* Autodetect the need for 64-bit DMA pointers.
-	 * When the IP is configured for a bus width bigger than 32 bits,
-	 * writing the MSB registers is mandatory, even if they are all 0.
-	 * We can detect this case by writing all 1's to one such register
-	 * and see if that sticks: when the IP is configured for 32 bits
-	 * only, those registers are RES0.
-	 * Those MSB registers were introduced in IP v7.1, which we check first.
-	 */
-	if ((axienet_ior(lp, XAE_ID_OFFSET) >> 24) >= 0x9) {
-		void __iomem *desc = lp->dma_regs + XAXIDMA_TX_CDESC_OFFSET + 4;
+		lp->tx_ts_regs = devm_ioremap_resource(&pdev->dev, &txtsres);
+		if (IS_ERR(lp->tx_ts_regs)) {
+			dev_err(&pdev->dev, "could not map Tx Timestamp regs\n");
+			ret = PTR_ERR(lp->tx_ts_regs);
+			goto free_netdev;
+		}
 
-		iowrite32(0x0, desc);
-		if (ioread32(desc) == 0) {	/* sanity check */
-			iowrite32(0xffffffff, desc);
-			if (ioread32(desc) > 0) {
-				lp->features |= XAE_FEATURE_DMA_64BIT;
-				addr_width = 64;
-				dev_info(&pdev->dev,
-					 "autodetected 64-bit DMA range\n");
+		if (lp->axienet_config->mactype == XAXIENET_10G_25G ||
+		    lp->axienet_config->mactype == XAXIENET_MRMAC) {
+			np = of_parse_phandle(pdev->dev.of_node,
+					      "xlnx,rxtsfifo", 0);
+			if (IS_ERR(np)) {
+				dev_err(&pdev->dev,
+					"couldn't find rx-timestamp FIFO\n");
+				ret = PTR_ERR(np);
+				goto free_netdev;
 			}
-			iowrite32(0x0, desc);
+
+			ret = of_address_to_resource(np, 0, &rxtsres);
+			if (ret) {
+				dev_err(&pdev->dev,
+					"unable to get rx-timestamp resource\n");
+				goto free_netdev;
+			}
+
+			lp->rx_ts_regs = devm_ioremap_resource(&pdev->dev,
+								&rxtsres);
+			if (IS_ERR(lp->rx_ts_regs)) {
+				dev_err(&pdev->dev,
+					"couldn't map rx-timestamp regs\n");
+				ret = PTR_ERR(lp->rx_ts_regs);
+				goto free_netdev;
+			}
+
+			lp->tx_ptpheader = devm_kzalloc(&pdev->dev,
+							lp->axienet_config->ts_header_len,
+							GFP_KERNEL);
+			spin_lock_init(&lp->ptp_tx_lock);
+		}
+
+		of_node_put(np);
+	}
+#endif
+
+#ifdef CONFIG_XILINX_TSN
+	if (lp->is_tsn)
+		ret = axienet_tsn_probe(pdev, lp, ndev);
+#endif
+	if (!lp->is_tsn) {
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+		ret = axienet_mcdma_probe(pdev, lp, ndev);
+#else
+		ret = axienet_dma_probe(pdev, ndev);
+#endif
+		if (ret) {
+			pr_err("Getting DMA resource failed\n");
+			goto free_netdev;
+		}
+
+		if (dma_set_mask_and_coherent(lp->dev, DMA_BIT_MASK(lp->dma_mask)) != 0) {
+			dev_warn(&pdev->dev, "default to %d-bit dma mask\n", XAE_DMA_MASK_MIN);
+			if (dma_set_mask_and_coherent(lp->dev, DMA_BIT_MASK(XAE_DMA_MASK_MIN)) != 0) {
+				dev_err(&pdev->dev, "dma_set_mask_and_coherent failed, aborting\n");
+				goto free_netdev;
+			}
+		}
+
+		ret = axienet_dma_clk_init(pdev);
+		if (ret) {
+			if (ret != -EPROBE_DEFER)
+				dev_err(&pdev->dev, "DMA clock init failed %d\n", ret);
+			goto free_netdev;
 		}
 	}
 
-	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(addr_width));
+	ret = axienet_clk_init(pdev, &lp->aclk, &lp->eth_sclk,
+			       &lp->eth_refclk, &lp->eth_dclk);
 	if (ret) {
-		dev_err(&pdev->dev, "No suitable DMA available\n");
-		goto cleanup_clk;
+		if (ret != -EPROBE_DEFER)
+			dev_err(&pdev->dev, "Ethernet clock init failed %d\n", ret);
+		goto err_disable_clk;
 	}
 
+	lp->eth_irq = platform_get_irq(pdev, 0);
 	/* Check for Ethernet core IRQ (optional) */
 	if (lp->eth_irq <= 0)
 		dev_info(&pdev->dev, "Ethernet core IRQ not defined\n");
@@ -2547,65 +3573,54 @@ static int axienet_probe(struct platform_device *pdev)
 	lp->coalesce_count_rx = XAXIDMA_DFT_RX_THRESHOLD;
 	lp->coalesce_count_tx = XAXIDMA_DFT_TX_THRESHOLD;
 
-	/* Reset core now that clocks are enabled, prior to accessing MDIO */
-	ret = __axienet_device_reset(lp);
-	if (ret)
-		goto cleanup_clk;
+	ret = of_get_phy_mode(pdev->dev.of_node, &lp->phy_mode);
+	if (ret < 0)
+		dev_warn(&pdev->dev, "couldn't find phy i/f\n");
+	if (lp->phy_mode == PHY_INTERFACE_MODE_1000BASEX)
+		lp->phy_flags = XAE_PHY_TYPE_1000BASE_X;
 
-	ret = axienet_mdio_setup(lp);
-	if (ret)
-		dev_warn(&pdev->dev,
-			 "error registering MDIO bus: %d\n", ret);
+	lp->phy_node = of_parse_phandle(pdev->dev.of_node, "phy-handle", 0);
+	if (lp->phy_node) {
+		lp->clk = devm_clk_get(&pdev->dev, NULL);
+		if (IS_ERR(lp->clk)) {
+			dev_warn(&pdev->dev, "Failed to get clock: %ld\n",
+				 PTR_ERR(lp->clk));
+			lp->clk = NULL;
+		} else {
+			ret = clk_prepare_enable(lp->clk);
+			if (ret) {
+				dev_err(&pdev->dev, "Unable to enable clock: %d\n",
+					ret);
+				goto free_netdev;
+			}
+		}
 
-	if (lp->phy_mode == PHY_INTERFACE_MODE_SGMII ||
-	    lp->phy_mode == PHY_INTERFACE_MODE_1000BASEX) {
-		lp->phy_node = of_parse_phandle(pdev->dev.of_node, "phy-handle", 0);
-		if (!lp->phy_node) {
-			dev_err(&pdev->dev, "phy-handle required for 1000BaseX/SGMII\n");
-			ret = -EINVAL;
-			goto cleanup_mdio;
-		}
-		lp->pcs_phy = of_mdio_find_device(lp->phy_node);
-		if (!lp->pcs_phy) {
-			ret = -EPROBE_DEFER;
-			goto cleanup_mdio;
-		}
-		lp->phylink_config.pcs_poll = true;
+		ret = axienet_mdio_setup(lp);
+		if (ret)
+			dev_warn(&pdev->dev,
+				 "error registering MDIO bus: %d\n", ret);
 	}
 
-	lp->phylink_config.dev = &ndev->dev;
-	lp->phylink_config.type = PHYLINK_NETDEV;
-
-	lp->phylink = phylink_create(&lp->phylink_config, pdev->dev.fwnode,
-				     lp->phy_mode,
-				     &axienet_phylink_ops);
-	if (IS_ERR(lp->phylink)) {
-		ret = PTR_ERR(lp->phylink);
-		dev_err(&pdev->dev, "phylink_create error (%i)\n", ret);
-		goto cleanup_mdio;
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	/* Create sysfs file entries for the device */
+	ret = axeinet_mcdma_create_sysfs(&lp->dev->kobj);
+	if (ret < 0) {
+		dev_err(lp->dev, "unable to create sysfs entries\n");
+		return ret;
 	}
+#endif
 
 	ret = register_netdev(lp->ndev);
 	if (ret) {
 		dev_err(lp->dev, "register_netdev() error (%i)\n", ret);
-		goto cleanup_phylink;
+		axienet_mdio_teardown(lp);
+		goto err_disable_clk;
 	}
 
 	return 0;
 
-cleanup_phylink:
-	phylink_destroy(lp->phylink);
-
-cleanup_mdio:
-	if (lp->pcs_phy)
-		put_device(&lp->pcs_phy->dev);
-	if (lp->mii_bus)
-		axienet_mdio_teardown(lp);
-	of_node_put(lp->phy_node);
-
-cleanup_clk:
-	clk_disable_unprepare(lp->clk);
-
+err_disable_clk:
+	axienet_clk_disable(pdev);
 free_netdev:
 	free_netdev(ndev);
 
@@ -2616,19 +3631,30 @@ static int axienet_remove(struct platform_device *pdev)
 {
 	struct net_device *ndev = platform_get_drvdata(pdev);
 	struct axienet_local *lp = netdev_priv(ndev);
+	int i;
 
+	if (!lp->is_tsn) {
+		for_each_rx_dma_queue(lp, i)
+			netif_napi_del(&lp->napi[i]);
+	}
+#ifdef CONFIG_XILINX_TSN_PTP
+		axienet_ptp_timer_remove(lp->timer_priv);
+#ifdef CONFIG_XILINX_TSN_QBV
+		axienet_qbv_remove(ndev);
+#endif
+#endif
 	unregister_netdev(ndev);
+	axienet_clk_disable(pdev);
 
-	if (lp->phylink)
-		phylink_destroy(lp->phylink);
+	if (lp->mii_bus)
+		axienet_mdio_teardown(lp);
 
-	if (lp->pcs_phy)
-		put_device(&lp->pcs_phy->dev);
+	if (lp->clk)
+		clk_disable_unprepare(lp->clk);
 
-	axienet_mdio_teardown(lp);
-
-	clk_disable_unprepare(lp->clk);
-
+#ifdef CONFIG_AXIENET_HAS_MCDMA
+	axeinet_mcdma_remove_sysfs(&lp->dev->kobj);
+#endif
 	of_node_put(lp->phy_node);
 	lp->phy_node = NULL;
 
