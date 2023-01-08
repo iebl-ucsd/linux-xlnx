@@ -708,7 +708,6 @@ int zynqmp_pm_feature(const u32 api_id);
 int zynqmp_pm_set_feature_config(enum pm_feature_config_id id, u32 value);
 int zynqmp_pm_get_feature_config(enum pm_feature_config_id id, u32 *payload);
 #else
->>>>>>> replacement
 static inline int zynqmp_pm_get_api_version(u32 *version)
 {
 	return -ENODEV;
@@ -822,7 +821,6 @@ static inline int zynqmp_pm_bootmode_write(u32 ps_mode)
 	return -ENODEV;
 }
 
->>>>>>> replacement
 static inline int zynqmp_pm_init_finalize(void)
 {
 	return -ENODEV;
@@ -914,7 +912,6 @@ static inline int zynqmp_pm_ulpi_reset(void)
 	return -ENODEV;
 }
 
->>>>>>> replacement
 static inline int zynqmp_pm_system_shutdown(const u32 type, const u32 subtype)
 {
 	return -ENODEV;
