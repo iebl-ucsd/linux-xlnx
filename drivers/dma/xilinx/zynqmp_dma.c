@@ -491,7 +491,7 @@ static int zynqmp_dma_alloc_chan_resources(struct dma_chan *dchan)
 	}
 
 	chan->desc_pool_v = dma_alloc_coherent(chan->dev,
-					       (2 * ZYNQMP_DMA_DESC_SIZE(chan) *
+					       ((size_t)(2 * ZYNQMP_DMA_DESC_SIZE(chan)) *
 					       ZYNQMP_DMA_NUM_DESCS),
 					       &chan->desc_pool_p, GFP_KERNEL);
 	if (!chan->desc_pool_v)
