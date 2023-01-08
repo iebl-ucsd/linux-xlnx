@@ -2286,13 +2286,17 @@ void dwc3_gadget_enable_irq(struct dwc3 *dwc)
 		reg |= DWC3_DEVTEN_ULSTCNGEN;
 
 	/* On 2.30a and above this bit enables U3/L2-L1 Suspend Events */
+	/* Enable hibernation IRQ */
+	if (dwc->has_hibernation)
+		reg |= DWC3_DEVTEN_HIBERNATIONREQEVTEN;
+
 	if (!DWC3_VER_IS_PRIOR(DWC3, 230A))
 		reg |= DWC3_DEVTEN_EOPFEN;
 
 	dwc3_writel(dwc->regs, DWC3_DEVTEN, reg);
 }
 
-static void dwc3_gadget_disable_irq(struct dwc3 *dwc)
+void dwc3_gadget_disable_irq(struct dwc3 *dwc)
 {
 	/* mask all interrupts */
 	dwc3_writel(dwc->regs, DWC3_DEVTEN, 0x00);
@@ -2984,6 +2988,17 @@ static int dwc3_gadget_ep_cleanup_completed_request(struct dwc3_ep *dep,
 		request_status = status;
 	}
 
+	req->request.actual = req->request.length - req->remaining;
+
+	if ((!dwc3_gadget_ep_request_completed(req) &&
+	     req->num_pending_sgs) || req->num_pending_sgs) {
+		if (!(event->status &
+			(DEPEVT_STATUS_SHORT | DEPEVT_STATUS_LST))) {
+			__dwc3_gadget_kick_transfer(dep);
+			goto out;
+		}
+	}
+
 	dwc3_gadget_giveback(dep, req, request_status);
 
 out:
@@ -3038,6 +3053,9 @@ static bool dwc3_gadget_endpoint_trbs_complete(struct dwc3_ep *dep,
 
 	dwc3_gadget_ep_cleanup_completed_requests(dep, event, status);
 
+	if (dep->stream_capable && !list_empty(&dep->started_list))
+		__dwc3_gadget_kick_transfer(dep);
+
 	if (dep->flags & DWC3_EP_END_TRANSFER_PENDING)
 		goto out;
 
@@ -3045,10 +3063,18 @@ static bool dwc3_gadget_endpoint_trbs_complete(struct dwc3_ep *dep,
 		return no_started_trb;
 
 	if (usb_endpoint_xfer_isoc(dep->endpoint.desc) &&
-		list_empty(&dep->started_list) &&
-		(list_empty(&dep->pending_list) || status == -EXDEV))
-		dwc3_stop_active_transfer(dep, true, true);
-	else if (dwc3_gadget_ep_should_continue(dep))
+	    list_empty(&dep->started_list)) {
+		if (list_empty(&dep->pending_list))
+			/*
+			 * If there is no entry in request list then do
+			 * not issue END TRANSFER now. Just set PENDING
+			 * flag, so that END TRANSFER is issued when an
+			 * entry is added into request list.
+			 */
+			dep->flags |= DWC3_EP_PENDING_REQUEST;
+		else if (status == -EXDEV)
+			dwc3_stop_active_transfer(dep, true, true);
+	} else if (dwc3_gadget_ep_should_continue(dep))
 		if (__dwc3_gadget_kick_transfer(dep) == 0)
 			no_started_trb = false;
 
@@ -3924,15 +3950,22 @@ static irqreturn_t dwc3_process_event_buf(struct dwc3_event_buffer *evt)
 		 */
 		evt->lpos = (evt->lpos + 4) % evt->length;
 		left -= 4;
+
+		/* Stop processing any events after core is hibernated */
+		if (dwc->is_hibernated)
+			break;
 	}
 
 	evt->count = 0;
 	ret = IRQ_HANDLED;
 
-	/* Unmask interrupt */
-	reg = dwc3_readl(dwc->regs, DWC3_GEVNTSIZ(0));
-	reg &= ~DWC3_GEVNTSIZ_INTMASK;
-	dwc3_writel(dwc->regs, DWC3_GEVNTSIZ(0), reg);
+	/* Prevent interrupt generation when hibernated */
+	if (!dwc->is_hibernated) {
+		/* Unmask interrupt */
+		reg = dwc3_readl(dwc->regs, DWC3_GEVNTSIZ(0));
+		reg &= ~DWC3_GEVNTSIZ_INTMASK;
+		dwc3_writel(dwc->regs, DWC3_GEVNTSIZ(0), reg);
+	}
 
 	if (dwc->imod_interval) {
 		dwc3_writel(dwc->regs, DWC3_GEVNTCOUNT(0), DWC3_GEVNTCOUNT_EHB);
