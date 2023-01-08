@@ -973,6 +973,21 @@ static void xilinx_dpdma_chan_queue_transfer(struct xilinx_dpdma_chan *chan)
 		channels = BIT(chan->id);
 	}
 
+	first_frame = chan->first_frame;
+	chan->first_frame = false;
+
+	if (video_group) {
+		channels = xilinx_dpdma_chan_video_group_ready(chan);
+		/*
+		 * Trigger the transfer only when all channels in the group are
+		 * ready.
+		 */
+		if (!channels)
+			return;
+	} else {
+		channels = BIT(chan->id);
+	}
+
 	if (first_frame)
 		reg = XILINX_DPDMA_GBL_TRIG_MASK(channels);
 	else
@@ -1143,7 +1158,8 @@ static void xilinx_dpdma_chan_done_irq(struct xilinx_dpdma_chan *chan)
 		vchan_cyclic_callback(&active->vdesc);
 	else
 		dev_warn(chan->xdev->dev,
-			 "DONE IRQ with no active descriptor!\n");
+			 "chan%u: DONE IRQ with no active descriptor!\n",
+			 chan->id);
 
 	spin_unlock_irqrestore(&chan->lock, flags);
 }
@@ -1175,8 +1191,12 @@ static void xilinx_dpdma_chan_vsync_irq(struct  xilinx_dpdma_chan *chan)
 	/* If the retrigger raced with vsync, retry at the next frame. */
 	sw_desc = list_first_entry(&pending->descriptors,
 				   struct xilinx_dpdma_sw_desc, node);
-	if (sw_desc->hw.desc_id != desc_id)
+	if (sw_desc->hw.desc_id != desc_id) {
+		dev_dbg(chan->xdev->dev,
+			"chan%u: vsync race lost (%u != %u), retrying\n",
+			chan->id, sw_desc->hw.desc_id, desc_id);
 		goto out;
+	}
 
 	/*
 	 * Complete the active descriptor, if any, promote the pending
