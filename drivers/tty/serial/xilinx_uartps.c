@@ -598,8 +598,6 @@ static void cdns_uart_start_tx(struct uart_port *port)
 	if (uart_tx_stopped(port))
 		return;
 
-	isrstatus &= port->read_status_mask;
-	isrstatus &= ~port->ignore_status_mask;
 	/*
 	 * Set the TX enable bit and clear the TX disable bit to enable the
 	 * transmitter.
