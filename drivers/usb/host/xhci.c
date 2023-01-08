@@ -202,7 +202,13 @@ int xhci_reset(struct xhci_hcd *xhci, u64 timeout_us)
 	if (xhci->quirks & XHCI_INTEL_HOST)
 		udelay(1000);
 
-	ret = xhci_handshake(&xhci->op_regs->command, CMD_RESET, 0, timeout_us);
+	ret = xhci_handshake(&xhci->op_regs->command,
+#ifdef CONFIG_USB_DWC3_OTG
+			CMD_LRESET,
+#else
+			CMD_RESET,
+#endif
+			0, timeout_us);
 	if (ret)
 		return ret;
 
