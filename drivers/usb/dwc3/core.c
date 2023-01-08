@@ -1706,6 +1706,21 @@ static int dwc3_probe(struct platform_device *pdev)
 	if (ret)
 		goto err5;
 
+	/*
+	 * DWC3 controller has a Power Management Unit(PMU) module
+	 * which requests the power controller for entering into
+	 * D3/D0 state. Try getting the regulator.
+	 */
+	dwc->dwc3_pmu = devm_regulator_get(dev,
+					   dev->parent->of_node->full_name);
+	if (!IS_ERR(dwc->dwc3_pmu)) {
+		ret = regulator_enable(dwc->dwc3_pmu);
+		if (ret) {
+			dev_err(dev, "Failed to enable dwc3_pmu supply\n");
+			goto err5;
+		}
+	}
+
 	pm_runtime_put(dev);
 
 	return 0;
@@ -1753,11 +1768,24 @@ static int dwc3_remove(struct platform_device *pdev)
 
 	pm_runtime_get_sync(&pdev->dev);
 
+	if (dwc->is_hibernated) {
+		/*
+		 * As we are about to get removed, wake the controller from
+		 * D3 & hibernation states
+		 */
+		dwc->force_hiber_wake = true;
+		dwc3_gadget_exit_hibernation(dwc);
+		dwc->force_hiber_wake = false;
+	}
+
 	dwc3_core_exit_mode(dwc);
 	dwc3_debugfs_exit(dwc);
 
 	dwc3_core_exit(dwc);
 	dwc3_ulpi_exit(dwc);
+
+	if (dwc->dwc3_pmu)
+		regulator_disable(dwc->dwc3_pmu);
 
 	pm_runtime_disable(&pdev->dev);
 	pm_runtime_put_noidle(&pdev->dev);
