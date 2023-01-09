@@ -95,6 +95,9 @@ static const struct flash_info gigadevice_parts[] = {
 			      SECT_4K | USE_FSR | SPI_NOR_OCTAL_READ |
 			      SPI_NOR_OCTAL_WRITE | SPI_NOR_4B_OPCODES)
 		.fixups = &gd25lx256e_fixups },
+	{ "gd25q512",  INFO(0xc84020, 0, 64 * 1024, 1024,
+			      SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ |
+			      SPI_NOR_HAS_LOCK | SPI_NOR_HAS_TB | SPI_NOR_4B_OPCODES) },
 };
 
 const struct spi_nor_manufacturer spi_nor_gigadevice = {
