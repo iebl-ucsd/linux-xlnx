@@ -3,7 +3,7 @@ found=false;
 for i in `ls openwrt_patches/pending-5.10`
 do
 	if [ "$found" = false ]; then
-		if [[ "$i" =~ ^483-mtd-spinand-add-support-for-xtx-xt26g0xa.* ]]; then
+		if [[ "$i" =~ ^483-mtd-spi-nor-add-gd25q512.patch.* ]]; then
 			found=true
 		fi
 		continue
@@ -21,6 +21,4 @@ do
 	else
 		break
 	fi
-	echo "SF"
-	break
 done
