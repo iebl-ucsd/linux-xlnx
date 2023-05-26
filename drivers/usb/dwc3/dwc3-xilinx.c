@@ -415,6 +415,7 @@ static int dwc3_xlnx_init_zynqmp(struct dwc3_xlnx *priv_data)
 		ret = -EPROBE_DEFER;
 		goto err;
 	} else if (IS_ERR(usb3_phy)) {
+		dev_dbg(dev, "USB3-phy not present; skipping usb3-phy\n");
 		ret = 0;
 		goto skip_usb3_phy;
 	}
@@ -455,6 +456,8 @@ static int dwc3_xlnx_init_zynqmp(struct dwc3_xlnx *priv_data)
 	/* Set the PIPE Clock Select bit in FPD PIPE Clock register */
 	writel(PIPE_CLK_SELECT, priv_data->regs + XLNX_USB_FPD_PIPE_CLK);
 
+	dev_dbg(dev, "Successfully set PIPE bits.\n");
+
 	ret = reset_control_deassert(crst);
 	if (ret < 0) {
 		dev_err(dev, "Failed to release core reset\n");
@@ -469,9 +472,11 @@ static int dwc3_xlnx_init_zynqmp(struct dwc3_xlnx *priv_data)
 
 	ret = phy_power_on(usb3_phy);
 	if (ret < 0) {
+		dev_dbg(dev, "Failed to power on phy.\n");
 		phy_exit(usb3_phy);
 		goto err;
 	}
+	dev_dbg(dev, "Successfully powered on usb3-phy.");
 
 skip_usb3_phy:
 	/* ulpi reset via gpio-modepin or gpio-framework driver */
